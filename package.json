@@ -1,0 +1,48 @@
+{
+  "name": "teachboard",
+  "productName": "TeachBoard",
+  "version": "1.0.0",
+  "description": "Whiteboard, PDF annotator and teaching browser for ICT lecturers",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win"
+  },
+  "author": "Sahan Silva",
+  "homepage": "https://github.com/SahansilvaDev/TeachBoard",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SahansilvaDev/TeachBoard.git"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "pdf-lib": "1.17.1",
+    "pdfjs-dist": "3.11.174"
+  },
+  "devDependencies": {
+    "electron": "33.2.1",
+    "electron-builder": "25.1.8"
+  },
+  "build": {
+    "appId": "lk.codeplus.teachboard",
+    "productName": "TeachBoard",
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "node_modules/pdfjs-dist/build/**/*",
+      "node_modules/pdf-lib/dist/**/*"
+    ],
+    "fileAssociations": [
+      { "ext": "tboard", "name": "TeachBoard Whiteboard" }
+    ],
+    "copyright": "Developed by Sahan Silva",
+    "win": { "target": "nsis", "icon": "src/assets/app-icon.png" },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "TeachBoard"
+    }
+  }
+}
