@@ -1,12 +1,13 @@
 {
   "name": "teachboard",
   "productName": "TeachBoard",
-  "version": "1.0.0",
-  "description": "Whiteboard, PDF annotator and teaching browser for ICT lecturers",
+  "version": "2.0.0",
+  "description": "Whiteboard, PDF annotator, architecture diagrams and teaching browser for ICT lecturers and software / AI architects",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --win"
+    "dist": "electron-builder --win",
+    "release": "electron-builder --win --publish always"
   },
   "author": "Sahan Silva",
   "homepage": "https://github.com/SahansilvaDev/TeachBoard",
@@ -16,6 +17,7 @@
   },
   "license": "UNLICENSED",
   "dependencies": {
+    "electron-updater": "6.3.9",
     "pdf-lib": "1.17.1",
     "pdfjs-dist": "3.11.174"
   },
@@ -34,10 +36,24 @@
       "node_modules/pdf-lib/dist/**/*"
     ],
     "fileAssociations": [
-      { "ext": "tboard", "name": "TeachBoard Whiteboard" }
+      {
+        "ext": "tboard",
+        "name": "TeachBoard Whiteboard"
+      }
     ],
     "copyright": "Developed by Sahan Silva",
-    "win": { "target": "nsis", "icon": "src/assets/app-icon.png" },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "SahansilvaDev",
+        "repo": "TeachBoard",
+        "releaseType": "release"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "src/assets/app-icon.png"
+    },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,

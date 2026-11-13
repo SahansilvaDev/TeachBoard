@@ -14,8 +14,11 @@
     { id: 'eraser', icon: 'eraser', title: 'Eraser (E) — click again for options' },
     { id: 'laser', icon: 'laser', title: 'Laser pointer (L)' },
     { id: 'text', icon: 'text', title: 'Text, sticky notes & code (T)' },
-    { id: 'shape', icon: 'shapes', title: 'Shapes, flowchart, logic gates, network icons (S)' },
+    { id: 'shape', icon: 'shapes', title: 'Shapes: flowchart, logic gates, network, UML, cloud, AI (S)' },
+    { id: 'connector', icon: 'connector', title: 'Connector (C) — drag from one shape to another; the arrow follows when you move them' },
   ];
+  // Tool settings remembered between sessions.
+  const SAVED_TOOLS = ['tool', 'color', 'size', 'shape', 'fill', 'dash', 'font', 'textStyle', 'fontSize', 'eraserMode', 'smoothing', 'snap', 'route', 'startArrow', 'endArrow'];
 
   const App = (window.App = {
     tabs: [],
@@ -28,7 +31,7 @@
     get focusedTab() { return this.split ? this.panes[this.focusPane] : this.panes[0]; },
     get currentBoard() { const t = this.focusedTab; return t ? t.board : null; },
 
-    init() {
+    async init() {
       this.stage = $('#stage');
       this.divider = $('#divider');
       $('#newTabBtn').innerHTML = icon('plus', 18);
@@ -40,11 +43,91 @@
       this.setupIpc();
       Tools.on((patch) => this.onToolsChanged(patch));
       window.addEventListener('resize', () => this.layout());
-      window.addEventListener('beforeunload', (e) => {
-        this.tabs.forEach((t) => t instanceof PdfTab && t.saveAnnotations());
-        if (this.tabs.some((t) => t instanceof BoardTab && t.dirty && t.board.doc.pages.some((p) => p.elements.length))) e.returnValue = false;
+      // Boards auto-save and the session is restored on the next start, so closing never loses work.
+      window.addEventListener('beforeunload', () => {
+        this.tabs.forEach((t) => {
+          if (t instanceof PdfTab) t.saveAnnotations();
+          if (t instanceof BoardTab) t.autosaveNow();
+        });
+        window.api.sessionSaveSync(this.sessionData());
       });
-      this.addTab(new HomeTab());
+      let restored = false;
+      try { restored = await this.restoreSession(); } catch (err) { console.error('session restore failed', err); }
+      if (!restored) this.addTab(new HomeTab());
+      setInterval(() => this.saveSession(), 4000);
+    },
+
+    // ---------------- Session (open tabs survive crashes, reloads and restarts) ----------------
+    sessionData() {
+      const tools = {};
+      SAVED_TOOLS.forEach((k) => { tools[k] = Tools[k]; });
+      return {
+        version: 2,
+        tabs: this.tabs.map((t) => t.sessionInfo()),
+        panes: this.panes.map((p) => this.tabs.indexOf(p)),
+        split: this.split,
+        focusPane: this.focusPane,
+        ratio: this.ratio,
+        tools,
+      };
+    },
+    saveSession() {
+      const data = this.sessionData();
+      const json = JSON.stringify(data);
+      if (json === this.lastSession) return;
+      this.lastSession = json;
+      window.api.sessionSave(data);
+    },
+    async restoreSession() {
+      const s = await window.api.sessionLoad();
+      if (!s || !Array.isArray(s.tabs) || !s.tabs.length) return false;
+      if (s.tools) Tools.set(Object.fromEntries(Object.entries(s.tools).filter(([k]) => SAVED_TOOLS.includes(k))));
+      const made = [];
+      for (const info of s.tabs) {
+        let t = null;
+        try { t = await this.tabFromInfo(info); } catch (err) { console.error('could not restore tab', info, err); }
+        made.push(t);
+        if (t) { this.tabs.push(t); this.stage.appendChild(t.el); }
+      }
+      if (!this.tabs.length) return false;
+      const pick = (i) => (i >= 0 && made[i]) || null;
+      this.panes = [pick(s.panes && s.panes[0]) || this.tabs[0], pick(s.panes && s.panes[1])];
+      this.split = !!(s.split && this.panes[1] && this.panes[1] !== this.panes[0]);
+      if (!this.split) this.panes[1] = null;
+      this.focusPane = this.split ? s.focusPane || 0 : 0;
+      this.ratio = s.ratio || 0.5;
+      this.afterShow(this.focusedTab);
+      if (this.split) this.panes[1 - this.focusPane].onShown();
+      return true;
+    },
+    async tabFromInfo(info) {
+      if (info.type === 'home') return new HomeTab();
+      if (info.type === 'web') return new WebTab(info.url);
+      if (info.type === 'pdf') return new PdfTab(info.path, { page: info.page, zoom: info.zoom });
+      if (info.type === 'board') {
+        let text = await window.api.autosaveRead(info.autosaveId);
+        if (!text && info.filePath) text = (await window.api.readText(info.filePath)).text;
+        if (!text) return null;
+        const data = JSON.parse(text);
+        const tab = new BoardTab({
+          doc: { bg: data.bg || 'white', pages: data.pages },
+          filePath: info.filePath, title: info.title, autosaveId: info.autosaveId, dirty: info.dirty,
+        });
+        if (info.page) tab.board.setPage(Math.min(info.page, tab.board.doc.pages.length - 1));
+        if (info.view) tab.board.setView(info.view);
+        tab.updateBar();
+        return tab;
+      }
+      return null;
+    },
+    // Reloads the window; everything open comes back through the session.
+    reloadApp() {
+      this.tabs.forEach((t) => {
+        if (t instanceof PdfTab) t.saveAnnotations();
+        if (t instanceof BoardTab) t.autosaveNow();
+      });
+      window.api.sessionSaveSync(this.sessionData());
+      window.api.reloadWindow();
     },
 
     // ---------------- Tabs ----------------
@@ -294,7 +377,7 @@
       rail.innerHTML = '';
       for (const t of TOOL_LIST) {
         const b = document.createElement('button');
-        b.className = 'tool-btn' + (['pen', 'highlighter', 'eraser', 'text', 'shape'].includes(t.id) ? ' has-menu' : '');
+        b.className = 'tool-btn' + (['pen', 'highlighter', 'eraser', 'text', 'shape', 'connector'].includes(t.id) ? ' has-menu' : '');
         b.dataset.tool = t.id;
         b.title = t.title;
         b.innerHTML = icon(t.icon, 22);
@@ -306,6 +389,12 @@
         b.oncontextmenu = (e) => { e.preventDefault(); this.selectTool(t.id); if (b.classList.contains('has-menu')) this.showToolOptions(t.id, b); };
         rail.appendChild(b);
       }
+      const tpl = document.createElement('button');
+      tpl.className = 'tool-btn';
+      tpl.title = 'Templates — ready-made diagrams (web app, microservices, RAG, AI agent, LAN)';
+      tpl.innerHTML = icon('template', 22);
+      tpl.onclick = () => this.showTemplates(tpl);
+      rail.appendChild(tpl);
       const img = document.createElement('button');
       img.className = 'tool-btn';
       img.title = 'Insert image from computer (I) — you can also paste (Ctrl V) or drag & drop';
@@ -407,7 +496,39 @@
 
     onToolsChanged(patch) {
       if ('tool' in patch) Board.all.forEach((b) => b.updateCursor());
+      if ('snap' in patch) this.tabs.forEach((t) => t instanceof BoardTab && t.updateBar());
       this.refreshRail();
+    },
+
+    showTemplates(anchor) {
+      const pop = this.popover(anchor, 'right');
+      pop.innerHTML = `<div class="pop-title">Templates — click to insert</div><div class="menu tpl-menu">${TB.TEMPLATES.map((t) =>
+        `<button data-tpl="${t.id}"><b>${t.name}</b><span>${t.desc}</span></button>`).join('')}</div>
+        <div class="pop-title" style="text-transform:none;letter-spacing:0">Everything stays editable: move boxes and the arrows follow, double-click to rename.</div>`;
+      pop.onclick = (e) => {
+        const b = e.target.closest('[data-tpl]');
+        if (!b) return;
+        this.closePopover();
+        this.insertTemplate(b.dataset.tpl);
+      };
+    },
+    insertTemplate(id) {
+      const tpl = TB.TEMPLATES.find((t) => t.id === id);
+      let tab = this.focusedTab;
+      if (!(tab instanceof BoardTab)) tab = this.targetBoardTab();
+      if (!this.panes.includes(tab)) this.showTab(tab);
+      tab.board.resize(); // a board that was just shown may not know its size yet
+      tab.board.insertElements(tpl.build());
+      Tools.set({ tool: 'select' });
+      // Make sure the whole template is visible.
+      requestAnimationFrame(() => {
+        const b = tab.board, sb = b.selBox();
+        if (b.cssW < 200 || b.cssH < 200) return; // not laid out yet
+        if (sb && (sb.w * b.view.zoom > b.cssW - 60 || sb.h * b.view.zoom > b.cssH - 100)) {
+          const z = Math.min((b.cssW - 80) / sb.w, (b.cssH - 140) / sb.h);
+          b.setView({ zoom: z, x: sb.x + sb.w / 2 - b.cssW / 2 / z, y: sb.y + sb.h / 2 - b.cssH / 2 / z });
+        }
+      });
     },
 
     showToolOptions(tool, anchor) {
@@ -417,7 +538,20 @@
       const slider = (key, min, max, label) =>
         `<div class="pop-title">${label}</div><div class="slider-row"><input type="range" min="${min}" max="${max}" value="${Tools[key]}" data-range="${key}"/><output>${Tools[key]}</output></div>`;
       let html = '';
-      if (tool === 'pen' || tool === 'highlighter') html = slider('size', 1, 40, 'Thickness');
+      if (tool === 'pen' || tool === 'highlighter') {
+        html = `${slider('size', 1, 40, 'Thickness')}${slider('smoothing', 0, 100, 'Smoothing (steadier handwriting)')}
+          <div class="pop-title" style="text-transform:none;letter-spacing:0">Higher smoothing removes touchpad shake. 0 = exactly as drawn.</div>`;
+      }
+      if (tool === 'connector') {
+        html = `<div class="pop-title">Line style</div>${chips('route', [['elbow', 'Elbow ┐'], ['straight', 'Straight ╱'], ['curve', 'Curved ⌒']])}
+          <div class="pop-title">Arrows</div><div class="pop-row">
+            <button class="chip ${Tools.startArrow ? 'active' : ''}" data-toggle="startArrow">◀ Start</button>
+            <button class="chip ${Tools.endArrow ? 'active' : ''}" data-toggle="endArrow">End ▶</button>
+            <button class="chip ${Tools.dash ? 'active' : ''}" data-toggle="dash">Dashed</button></div>
+          ${slider('size', 1, 12, 'Thickness')}
+          <div class="pop-title" style="text-transform:none;letter-spacing:0">Drag from one shape to another — it turns green when it will attach.
+            Moved shapes keep their arrows. Double-click an arrow (with Select) to add a label like "HTTPS".</div>`;
+      }
       if (tool === 'eraser') {
         html = `<div class="pop-title">Eraser</div>${chips('eraserMode', [['partial', 'Rub out (part of a line)'], ['object', 'Whole object']])}
           ${slider('size', 1, 40, 'Eraser size')}
@@ -430,7 +564,8 @@
           <div class="pop-title" style="text-transform:none;letter-spacing:0">Click on the board to type. Ctrl+Enter or Esc to finish. Code blocks get colour highlighting.</div>`;
       }
       if (tool === 'shape') {
-        html = SHAPE_GROUPS.map((g) => `<div class="pop-title">${g.name}</div><div class="shape-grid">${g.items
+        html = `<div class="pop-row" style="margin-bottom:4px"><button class="chip" data-templates>${icon('template', 14)} Templates…</button></div>`;
+        html += SHAPE_GROUPS.map((g) => `<div class="pop-title">${g.name}</div><div class="shape-grid">${g.items
           .map((k) => `<button class="shape-cell ${Tools.shape === k ? 'active' : ''}" data-shape="${k}" title="${SHAPES[k].name}"><canvas></canvas></button>`).join('')}</div>`).join('');
         html += `<div class="pop-row" style="margin-top:6px;gap:10px"><span style="color:var(--muted);font-size:12px">Table</span>
             <input class="num" type="number" min="1" max="20" value="${Tools.tableRows}" data-num="tableRows" title="Rows"/> ×
@@ -459,6 +594,14 @@
           if (this.currentBoard && this.currentBoard.sel.length) this.currentBoard.applyStyle({ dash: Tools.dash });
           dash.parentElement.querySelectorAll('.chip').forEach((x) => x.classList.toggle('active', x === dash));
         }
+        const tog = e.target.closest('[data-toggle]');
+        if (tog) {
+          const k = tog.dataset.toggle;
+          Tools.set({ [k]: !Tools[k] });
+          tog.classList.toggle('active', Tools[k]);
+          if (this.currentBoard && this.currentBoard.sel.length) this.currentBoard.applyStyle({ [k]: Tools[k] });
+        }
+        if (e.target.closest('[data-templates]')) { this.showTemplates(anchor); return; }
         if (e.target.closest('[data-clear]')) { this.closePopover(); if (this.focusedTab) this.focusedTab.clear(); }
       };
       pop.querySelectorAll('[data-range]').forEach((r) => r.addEventListener('input', () => {
@@ -495,7 +638,8 @@
         ['timer', 'timer', 'Countdown timer / stopwatch', ''],
         ['picker', 'dice', 'Pick a random student', ''],
         ['spot', 'spotlight', 'Spotlight — focus attention on one area', ''],
-        ['help', 'help', 'Keyboard shortcuts', ''],
+        ['reload', 'reload', 'Reload TeachBoard (Ctrl Shift R) — fixes a blank screen; your tabs come back', ''],
+        ['help', 'help', 'Shortcuts, version and updates', ''],
         ['full', 'fullscreen', 'Full screen (F11)', ''],
       ];
       box.innerHTML = items.map(([a, ic, title, lbl]) => `<button class="icon-btn" data-act="${a}" title="${title}">${icon(ic, 18)}${lbl ? `<span class="lbl">${lbl}</span>` : ''}</button>`).join('');
@@ -511,15 +655,18 @@
           case 'picker': Widgets.openPicker(); break;
           case 'spot': Widgets.toggleSpotlight(); break;
           case 'help': this.showHelp(b); break;
+          case 'reload': this.reloadApp(); break;
           case 'full': window.api.toggleFullscreen(); break;
         }
       };
     },
 
-    showHelp(anchor) {
+    async showHelp(anchor) {
       const pop = this.popover(anchor, 'down');
+      const version = await window.api.appVersion();
       const rows = [
         ['V  H  P  M  E  L  T', 'Select, Pan, Pen, Highlighter, Eraser, Laser, Text'],
+        ['C', 'Connector (arrow that sticks to shapes)'],
         ['S / R / O / A', 'Shapes / Rectangle / Ellipse / Arrow'],
         ['1 … 0', 'Pick colour'], ['[  ]', 'Thinner / thicker'],
         ['Space + drag', 'Pan the board'], ['Ctrl + wheel / pinch', 'Zoom'], ['Two-finger scroll', 'Move around the board'],
@@ -527,14 +674,41 @@
         ['Ctrl V (image)', 'Paste a screenshot or copied image'], ['Shift + drag', 'Straight line / perfect square'],
         ['Page Up / Down', 'Previous / next board page'],
         ['Ctrl T / Ctrl W', 'New tab / Close tab'], ['Ctrl Tab', 'Next tab'], ['Ctrl N', 'New whiteboard'], ['Ctrl O', 'Open PDF'],
-        ['Ctrl S', 'Save whiteboard'], ['Ctrl \\', 'Split screen on/off'], ['F11', 'Full screen'], ['Esc', 'Cancel / close'],
+        ['Ctrl S', 'Save whiteboard'], ['Ctrl \\', 'Split screen on/off'], ['F11', 'Full screen'],
+        ['Ctrl Shift R', 'Reload (fixes a blank screen; tabs come back)'], ['Esc', 'Cancel / close'],
       ];
-      pop.innerHTML = `<div class="pop-title">Keyboard shortcuts</div><table class="help-table">${rows.map(([k, d]) => `<tr><td>${k}</td><td>${d}</td></tr>`).join('')}</table>
-        <div class="pop-title" style="margin-top:14px">About</div>
+      pop.innerHTML = `<div class="pop-title">About</div>
         <div style="display:flex;align-items:center;gap:10px;font-size:13px;color:var(--muted)">
           <img src="assets/app-icon-64.png" width="32" height="32" style="border-radius:7px" />
-          <div>TeachBoard 1.0 — developed by <b style="color:var(--text)">Sahan Silva</b></div>
-        </div>`;
+          <div style="flex:1">TeachBoard ${version} — developed by <b style="color:var(--text)">Sahan Silva</b></div>
+          <button class="chip" data-update>${icon('update', 14)} Check for updates</button>
+        </div>
+        <div class="pop-title" style="margin-top:14px">Keyboard shortcuts</div><table class="help-table">${rows.map(([k, d]) => `<tr><td>${k}</td><td>${d}</td></tr>`).join('')}</table>`;
+      pop.querySelector('[data-update]').onclick = async () => {
+        this.updateAsked = true;
+        const r = await window.api.updateCheck();
+        if (r.state === 'dev') this.toast('Updates work in the installed app (not when running with npm start)');
+        else if (r.state === 'error') this.toast('Could not check for updates: ' + r.message, 'error');
+        else this.toast('Checking for updates…');
+      };
+    },
+
+    // Messages from the auto-updater in the main process.
+    onUpdateStatus(s) {
+      if (s.state === 'downloading' && s.version) this.toast(`Downloading TeachBoard ${s.version} in the background…`);
+      if (s.state === 'latest' && this.updateAsked) this.toast(`You have the latest version (${s.version})`);
+      if (s.state === 'ready') {
+        this.toast(`TeachBoard ${s.version} is ready.`, 'info', { label: 'Restart & update', run: () => this.installUpdate() }, 0);
+      }
+      if (s.state === 'error' && this.updateAsked) this.toast('Update failed: ' + s.message, 'error');
+    },
+    installUpdate() {
+      this.tabs.forEach((t) => {
+        if (t instanceof PdfTab) t.saveAnnotations();
+        if (t instanceof BoardTab) t.autosaveNow();
+      });
+      window.api.sessionSaveSync(this.sessionData());
+      window.api.updateInstall();
     },
 
     // ---------------- Popover & toasts ----------------
@@ -559,10 +733,13 @@
     },
     closePopover() { $('#popover').hidden = true; this.popAnchor = null; },
 
-    toast(msg, type = 'info', action) {
+    // duration: ms before it disappears; 0 keeps it until removed (returned element) or clicked.
+    toast(msg, type = 'info', action, duration) {
       const t = document.createElement('div');
       t.className = 'toast' + (type === 'error' ? ' error' : '');
-      t.textContent = msg;
+      const span = document.createElement('span');
+      span.textContent = msg;
+      t.appendChild(span);
       if (action) {
         const b = document.createElement('button');
         b.textContent = action.label;
@@ -570,7 +747,10 @@
         t.appendChild(b);
       }
       $('#toasts').appendChild(t);
-      setTimeout(() => t.remove(), action ? 6000 : 3000);
+      const ms = duration ?? (type === 'error' ? 7000 : action ? 6000 : 3000);
+      if (ms) setTimeout(() => t.remove(), ms);
+      else if (!action) t.onclick = () => t.remove();
+      return t;
     },
 
     // ---------------- Keyboard ----------------
@@ -630,6 +810,7 @@
       const prevent = () => e.preventDefault && e.preventDefault();
 
       if (k === 'F11') { prevent(); window.api.toggleFullscreen(); return; }
+      if (ctrl && e.shiftKey && (k === 'r' || k === 'R')) { prevent(); this.reloadApp(); return; }
       if (ctrl && (k === 't' || k === 'T')) { prevent(); this.addTab(new HomeTab()); return; }
       if (ctrl && (k === 'w' || k === 'W')) { prevent(); if (tab) this.closeTab(tab); return; }
       if (ctrl && k === 'Tab') { prevent(); this.cycleTab(e.shiftKey ? -1 : 1); return; }
@@ -673,7 +854,7 @@
       if ((k === 'PageDown' || k === 'PageUp') && tab instanceof BoardTab) { prevent(); tab.act(k === 'PageDown' ? 'next' : 'prev'); return; }
       if (ctrl || e.altKey) return;
 
-      const toolKeys = { v: 'select', h: 'hand', p: 'pen', m: 'highlighter', e: 'eraser', l: 'laser', t: 'text', s: 'shape' };
+      const toolKeys = { v: 'select', h: 'hand', p: 'pen', m: 'highlighter', e: 'eraser', l: 'laser', t: 'text', s: 'shape', c: 'connector' };
       const lk = k.toLowerCase();
       if (toolKeys[lk]) { this.selectTool(toolKeys[lk]); return; }
       if (lk === 'r' || lk === 'o' || lk === 'a') { Tools.set({ shape: { r: 'rect', o: 'ellipse', a: 'arrow' }[lk] }); this.selectTool('shape'); return; }
@@ -702,6 +883,7 @@
         if (data) this.sendImageToBoard(data, 'Snapshot added to');
       });
       api.onShortcut((s) => this.handleKey({ key: s.key, ctrlKey: s.control, shiftKey: s.shift, altKey: s.alt, target: document.body }));
+      api.onUpdateStatus((s) => this.onUpdateStatus(s));
       api.onFullscreenChanged((on) => {
         const b = $('#topActions [data-act=full]');
         b.innerHTML = icon(on ? 'exitfull' : 'fullscreen', 18);

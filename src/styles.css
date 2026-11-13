@@ -53,6 +53,7 @@ input, select { font: inherit; }
 .icon-btn {
   height: 34px; min-width: 34px; padding: 0 8px; border: none; border-radius: 8px; background: transparent;
   display: inline-flex; align-items: center; justify-content: center; gap: 6px; cursor: pointer; color: var(--text);
+  white-space: nowrap; flex: none;
 }
 .icon-btn:hover { background: var(--chrome-3); }
 .icon-btn.on { background: var(--accent); color: #fff; }
@@ -77,19 +78,19 @@ input, select { font: inherit; }
 /* ---------- Tool rail ---------- */
 #toolrail {
   width: var(--rail); flex: none; background: var(--chrome); border-right: 1px solid var(--line);
-  display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 8px 0; overflow-y: auto; scrollbar-width: none;
+  display: flex; flex-direction: column; align-items: center; gap: 1px; padding: 6px 0; overflow-y: auto; scrollbar-width: none;
 }
 #toolrail::-webkit-scrollbar { display: none; }
 #toolrail.disabled > *:not(.always) { opacity: .3; pointer-events: none; }
 .tool-btn {
-  width: 44px; height: 36px; border: none; border-radius: 9px; background: transparent; cursor: pointer;
+  width: 44px; height: 33px; border: none; border-radius: 9px; background: transparent; cursor: pointer;
   display: grid; place-items: center; color: var(--text); position: relative; flex: none;
 }
 .tool-btn:hover { background: var(--chrome-3); }
 .tool-btn.active { background: var(--accent); color: #fff; }
 .tool-btn.has-menu::after { content: ''; position: absolute; right: 4px; bottom: 4px; border: 3px solid transparent; border-right-color: currentColor; border-bottom-color: currentColor; opacity: .6; }
-.rail-sep { width: 36px; height: 1px; background: var(--line); margin: 4px 0; flex: none; }
-.swatches { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 8px; padding: 2px 0; flex: none; }
+.rail-sep { width: 36px; height: 1px; background: var(--line); margin: 3px 0; flex: none; }
+.swatches { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 8px; padding: 2px 0; flex: none; }
 .swatch {
   width: 18px; height: 18px; border-radius: 50%; border: 2px solid rgba(255,255,255,.15); cursor: pointer; padding: 0;
 }
@@ -159,6 +160,16 @@ input[type=range] { accent-color: var(--accent); width: 100%; }
   white-space: pre; margin: 0; min-height: 1em; tab-size: 4;
 }
 .tb-label-editor { text-align: center; background: rgba(255,255,255,.6); white-space: pre-wrap; }
+.tb-selbar {
+  position: absolute; z-index: 4; display: flex; align-items: center; gap: 1px; padding: 3px; white-space: nowrap;
+  background: rgba(30,31,36,.95); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 6px 18px rgba(0,0,0,.3);
+}
+.tb-selbar button { width: 30px; height: 28px; border: none; border-radius: 7px; background: none; color: var(--text); cursor: pointer; display: grid; place-items: center; padding: 0; }
+.tb-selbar button:hover { background: var(--chrome-3); }
+.tb-selbar .tb-align { display: inline-flex; align-items: center; gap: 1px; }
+.tb-selbar .tb-align i { width: 1px; height: 18px; background: var(--line); margin: 0 4px; }
+.tpl-menu button { flex-direction: column; align-items: flex-start; gap: 2px; }
+.tpl-menu button span { color: var(--muted); font-size: 12px; }
 .drop-hint { position: absolute; inset: 0; border: 4px dashed var(--accent); background: rgba(59,130,246,.08); pointer-events: none; z-index: 5; display: grid; place-items: center; font-size: 22px; color: var(--accent); font-weight: 600; }
 
 /* ---------- PDF tab ---------- */

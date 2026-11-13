@@ -61,6 +61,7 @@ function createMainWindow() {
 
   // Unsaved whiteboards: the page cancels unload, we ask the teacher.
   mainWin.webContents.on('will-prevent-unload', (e) => {
+    if (installingUpdate) { e.preventDefault(); return; }
     const choice = dialog.showMessageBoxSync(mainWin, {
       type: 'warning',
       buttons: ['Close without saving', 'Go back'],
@@ -78,7 +79,79 @@ function createMainWindow() {
     if (f) mainWin.webContents.send('open-path', f);
   });
   mainWin.on('closed', () => { mainWin = null; });
+
+  // If the page crashes (the "white screen") or freezes, offer a reload. The renderer saves its
+  // session every few seconds, so reloading brings back the open PDFs, boards and pages.
+  mainWin.webContents.on('render-process-gone', (_e, details) => {
+    if (details.reason === 'clean-exit') return;
+    askReload('TeachBoard stopped working', `The window crashed (${details.reason}). Reload to continue — your open tabs and drawings will come back.`);
+  });
+  mainWin.webContents.on('unresponsive', () => {
+    askReload('TeachBoard is not responding', 'Reload the window? Your open tabs and drawings will come back.', true);
+  });
 }
+
+let reloadAsked = false;
+function askReload(title, detail, canWait) {
+  if (!mainWin || reloadAsked) return;
+  reloadAsked = true;
+  const buttons = canWait ? ['Reload', 'Wait'] : ['Reload'];
+  const choice = dialog.showMessageBoxSync(mainWin, { type: 'warning', title, message: title, detail, buttons, defaultId: 0, noLink: true });
+  reloadAsked = false;
+  if (choice === 0 && mainWin) mainWin.webContents.reload();
+}
+
+app.on('child-process-gone', (_e, details) => {
+  // A GPU crash can leave the window blank even though the page itself is fine.
+  if (details.type === 'GPU' && details.reason !== 'clean-exit') {
+    askReload('The display stopped working', 'Reload the window to redraw it? Your open tabs and drawings will come back.', true);
+  }
+});
+
+// ---------- Auto-update from GitHub Releases ----------
+let installingUpdate = false;
+let autoUpdater = null;
+const sendUpdate = (s) => mainWin && mainWin.webContents.send('update-status', s);
+
+function setupUpdater() {
+  if (!app.isPackaged) return; // only installed copies update themselves
+  ({ autoUpdater } = require('electron-updater'));
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.on('checking-for-update', () => sendUpdate({ state: 'checking' }));
+  autoUpdater.on('update-available', (i) => sendUpdate({ state: 'downloading', version: i.version, percent: 0 }));
+  autoUpdater.on('update-not-available', () => sendUpdate({ state: 'latest', version: app.getVersion() }));
+  autoUpdater.on('download-progress', (p) => sendUpdate({ state: 'downloading', percent: Math.round(p.percent) }));
+  autoUpdater.on('update-downloaded', (i) => sendUpdate({ state: 'ready', version: i.version }));
+  autoUpdater.on('error', (err) => sendUpdate({ state: 'error', message: String((err && err.message) || err).split('\n')[0].slice(0, 200) }));
+  setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 5000);
+}
+
+ipcMain.handle('app-version', () => app.getVersion());
+ipcMain.handle('update-check', async () => {
+  if (!autoUpdater) return { state: 'dev' };
+  try { await autoUpdater.checkForUpdates(); return { state: 'checking' }; }
+  catch (err) { return { state: 'error', message: String(err.message || err).split('\n')[0] }; }
+});
+ipcMain.handle('update-install', () => {
+  if (!autoUpdater) return;
+  installingUpdate = true;
+  autoUpdater.quitAndInstall();
+});
+
+// ---------- Session restore + board auto-save ----------
+const SESSION_FILE = () => userFile('session.json');
+const autosaveFile = (id) => userFile(path.join('autosave', String(id).replace(/[^a-z0-9]/gi, '') + '.tboard'));
+ipcMain.handle('session-load', () => readJSON(SESSION_FILE(), null));
+ipcMain.handle('session-save', (_e, data) => writeJSON(SESSION_FILE(), data));
+ipcMain.on('session-save-sync', (e, data) => { try { writeJSON(SESSION_FILE(), data); } catch {} e.returnValue = true; });
+ipcMain.handle('autosave-write', (_e, id, text) => {
+  fs.mkdirSync(path.dirname(autosaveFile(id)), { recursive: true });
+  fs.writeFileSync(autosaveFile(id), text, 'utf8');
+});
+ipcMain.handle('autosave-read', (_e, id) => { try { return fs.readFileSync(autosaveFile(id), 'utf8'); } catch { return null; } });
+ipcMain.handle('autosave-delete', (_e, id) => { try { fs.unlinkSync(autosaveFile(id)); } catch {} });
+ipcMain.handle('reload-window', () => mainWin && mainWin.webContents.reload());
 
 // ---------- Browser (webview) behaviour ----------
 app.on('web-contents-created', (_e, contents) => {
@@ -92,7 +165,8 @@ app.on('web-contents-created', (_e, contents) => {
     const forward =
       k === 'F11' || k === 'F5' ||
       (ctrl && ['t', 'w', 'n', 'o', '\\', 'Tab', '=', '+', '-', '0'].includes(k.length === 1 ? k.toLowerCase() : k)) ||
-      (input.alt && (k === 'ArrowLeft' || k === 'ArrowRight'));
+      (input.alt && (k === 'ArrowLeft' || k === 'ArrowRight')) ||
+      (ctrl && input.shift && k.toLowerCase() === 'r');
     if (!forward || !contents.hostWebContents) return;
     event.preventDefault();
     contents.hostWebContents.send('shortcut', { key: k, control: ctrl, shift: input.shift, alt: input.alt });
@@ -290,6 +364,7 @@ if (!gotLock) {
   app.whenReady().then(() => {
     session.fromPartition('persist:web').setUserAgent(CHROME_UA);
     createMainWindow();
+    setupUpdater();
   });
   app.on('window-all-closed', () => app.quit());
 }

@@ -41,6 +41,11 @@
     eraserMode: 'partial', // partial | object
     tableRows: 3,
     tableCols: 3,
+    smoothing: 50, // 0 = raw input, 100 = very steady ink
+    snap: false, // snap shapes to a 20-unit grid
+    route: 'elbow', // connector style: straight | elbow | curve
+    startArrow: false,
+    endArrow: true,
     _listeners: [],
     set(patch) {
       Object.assign(this, patch);
@@ -58,12 +63,76 @@
     return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
   }
   const LINE_KINDS = new Set(['line', 'arrow', 'dblarrow']);
+  const GRID = 20;
+  const snapV = (v) => Math.round(v / GRID) * GRID;
+
+  let idSeq = 0;
+  const uid = () => Date.now().toString(36) + (idSeq++).toString(36) + Math.random().toString(36).slice(2, 6);
+  function ensureId(el) { if (!el.id) el.id = uid(); return el; }
+
+  // Gives copied elements fresh ids and keeps connectors attached to the copied shapes.
+  function remapIds(list) {
+    const map = new Map();
+    const out = list.map((e) => { const c = { ...e, id: uid() }; if (e.id) map.set(e.id, c.id); return c; });
+    for (const c of out) {
+      if (c.type !== 'connector') continue;
+      c.from = c.from && map.has(c.from.id) ? { id: map.get(c.from.id) } : null;
+      c.to = c.to && map.has(c.to.id) ? { id: map.get(c.to.id) } : null;
+    }
+    return out;
+  }
+
+  // Ramer–Douglas–Peucker: drop points that don't change the shape of a stroke.
+  function simplify(pts, eps) {
+    if (pts.length < 3) return pts;
+    const keep = new Uint8Array(pts.length);
+    keep[0] = keep[pts.length - 1] = 1;
+    const stack = [[0, pts.length - 1]];
+    while (stack.length) {
+      const [a, b] = stack.pop();
+      let maxD = 0, idx = -1;
+      for (let i = a + 1; i < b; i++) {
+        const d = distToSeg(pts[i][0], pts[i][1], pts[a][0], pts[a][1], pts[b][0], pts[b][1]);
+        if (d > maxD) { maxD = d; idx = i; }
+      }
+      if (maxD > eps) { keep[idx] = 1; stack.push([a, idx], [idx, b]); }
+    }
+    return pts.filter((_, i) => keep[i]);
+  }
+
+  // Evens out small wiggles: each inner point moves toward the average of its neighbours.
+  // The first and last points never move, so the stroke still starts and ends where it was drawn.
+  function relax(pts, passes) {
+    for (let k = 0; k < passes && pts.length > 2; k++) {
+      const out = [pts[0]];
+      for (let i = 1; i < pts.length - 1; i++) {
+        const a = pts[i - 1], p = pts[i], b = pts[i + 1];
+        out.push([(a[0] + 2 * p[0] + b[0]) / 4, (a[1] + 2 * p[1] + b[1]) / 4, p[2]]);
+      }
+      out.push(pts[pts.length - 1]);
+      pts = out;
+    }
+    return pts;
+  }
+
+  // Shapes that can be connected to and that hold a label.
+  const isBox = (el) => (el.type === 'shape' && !LINE_KINDS.has(el.kind)) || el.type === 'image' || el.type === 'text';
+  function boxOf(el) {
+    if (el.type === 'shape') return { x: Math.min(el.x1, el.x2), y: Math.min(el.y1, el.y2), w: Math.abs(el.x2 - el.x1), h: Math.abs(el.y2 - el.y1) };
+    return { x: el.x, y: el.y, w: el.w, h: el.h };
+  }
 
   const bboxCache = new WeakMap();
   function bbox(el) {
     let b = bboxCache.get(el);
     if (b) return b;
-    if (el.type === 'stroke') {
+    if (el.type === 'connector') {
+      const pts = connectorPath(el);
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const p of pts) { x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); }
+      const r = el.size * 3;
+      b = { x: x0 - r, y: y0 - r, w: x1 - x0 + 2 * r, h: y1 - y0 + 2 * r };
+    } else if (el.type === 'stroke') {
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
       for (const p of el.pts) {
         if (p[0] < x0) x0 = p[0];
@@ -76,7 +145,9 @@
     } else if (el.type === 'shape') {
       const r = el.size / 2;
       const x = Math.min(el.x1, el.x2), y = Math.min(el.y1, el.y2);
-      b = { x: x - r, y: y - r, w: Math.abs(el.x2 - el.x1) + 2 * r, h: Math.abs(el.y2 - el.y1) + 2 * r };
+      // Icons with a label underneath extend below their box.
+      const below = el.label && SHAPES[el.kind] && SHAPES[el.kind].labelBelow ? (el.labelSize || 18) * 1.4 * el.label.split('\n').length + 6 : 0;
+      b = { x: x - r, y: y - r, w: Math.abs(el.x2 - el.x1) + 2 * r, h: Math.abs(el.y2 - el.y1) + 2 * r + below };
     } else {
       b = { x: el.x, y: el.y, w: el.w, h: el.h };
     }
@@ -99,6 +170,18 @@
   function hitEl(el, x, y, tol, strict) {
     const b = bbox(el);
     if (!inBox(b, x, y, tol)) return false;
+    if (el.type === 'connector') {
+      const p = connectorPath(el), r = el.size / 2 + tol;
+      for (let i = 1; i < p.length; i++) if (distToSeg(x, y, p[i - 1][0], p[i - 1][1], p[i][0], p[i][1]) <= r) return true;
+      if (el.label) { const m = connectorMid(el); return Math.abs(x - m[0]) < 40 && Math.abs(y - m[1]) < 14; }
+      return false;
+    }
+    if (el.type === 'shape' && el.kind === 'frame') {
+      // Frames are only grabbed by their border or title, so you can still work inside them.
+      const r = Math.max(el.size, 4) + tol, fb = boxOf(el);
+      const title = y >= fb.y && y <= fb.y + (el.labelSize || 20) * 1.8 && x <= fb.x + fb.w;
+      return title || x < fb.x + r || x > fb.x + fb.w - r || y < fb.y + r || y > fb.y + fb.h - r;
+    }
     if (el.type === 'stroke') {
       const r = el.size / 2 + tol, p = el.pts;
       if (p.length === 1) return Math.hypot(x - p[0][0], y - p[0][1]) <= r;
@@ -130,8 +213,98 @@
       const a = f(el.x, el.y), b = f(el.x + el.w, el.y + el.h);
       c.x = Math.min(a[0], b[0]); c.y = Math.min(a[1], b[1]);
       c.w = Math.abs(b[0] - a[0]); c.h = Math.abs(b[1] - a[1]);
+    } else if (el.type === 'connector') {
+      [c.x1, c.y1] = f(el.x1, el.y1);
+      [c.x2, c.y2] = f(el.x2, el.y2);
     }
     return c;
+  }
+
+  // ---------- Connectors ----------
+  // A connector stores both end points (x1,y1)-(x2,y2) and the outward direction at each end
+  // (n1, n2). Ends bound to a shape (from/to = { id }) are recomputed by Board.syncConnectors()
+  // whenever the shapes change, so arrows follow the boxes they connect.
+
+  // Point where the line from the box centre toward (tx,ty) leaves the box, plus the side's normal.
+  function boxExit(b, tx, ty, route) {
+    const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    const dx = tx - cx, dy = ty - cy;
+    const gap = 4;
+    if (route === 'elbow') {
+      // Leave from the middle of the side facing the other end.
+      if (Math.abs(dx) * b.h >= Math.abs(dy) * b.w) return dx >= 0 ? [b.x + b.w + gap, cy, 1, 0] : [b.x - gap, cy, -1, 0];
+      return dy >= 0 ? [cx, b.y + b.h + gap, 0, 1] : [cx, b.y - gap, 0, -1];
+    }
+    if (!dx && !dy) return [cx, cy, 1, 0];
+    const sx = dx ? (b.w / 2) / Math.abs(dx) : Infinity, sy = dy ? (b.h / 2) / Math.abs(dy) : Infinity;
+    const s = Math.min(sx, sy);
+    const len = Math.hypot(dx, dy);
+    const px = cx + dx * s + (dx / len) * gap, py = cy + dy * s + (dy / len) * gap;
+    return sx < sy ? [px, py, Math.sign(dx), 0] : [px, py, 0, Math.sign(dy)];
+  }
+
+  // The polyline used to draw / hit-test a connector (curves are sampled).
+  function connectorPath(el) {
+    const { x1, y1, x2, y2 } = el;
+    const n1 = el.n1 || [0, 0], n2 = el.n2 || [0, 0];
+    if (el.route === 'elbow') {
+      const off = 18;
+      const a = [x1 + n1[0] * off, y1 + n1[1] * off], b = [x2 + n2[0] * off, y2 + n2[1] * off];
+      const horiz = n1[0] !== 0 || (n1[1] === 0 && Math.abs(x2 - x1) >= Math.abs(y2 - y1));
+      const pts = [[x1, y1], a];
+      if (horiz) { const mx = (a[0] + b[0]) / 2; pts.push([mx, a[1]], [mx, b[1]]); }
+      else { const my = (a[1] + b[1]) / 2; pts.push([a[0], my], [b[0], my]); }
+      pts.push(b, [x2, y2]);
+      return pts;
+    }
+    if (el.route === 'curve') {
+      const k = Math.max(40, Math.hypot(x2 - x1, y2 - y1) * 0.4);
+      const c1 = [x1 + n1[0] * k, y1 + n1[1] * k], c2 = [x2 + n2[0] * k, y2 + n2[1] * k];
+      const pts = [];
+      for (let i = 0; i <= 24; i++) {
+        const t = i / 24, u = 1 - t;
+        pts.push([
+          u * u * u * x1 + 3 * u * u * t * c1[0] + 3 * u * t * t * c2[0] + t * t * t * x2,
+          u * u * u * y1 + 3 * u * u * t * c1[1] + 3 * u * t * t * c2[1] + t * t * t * y2,
+        ]);
+      }
+      return pts;
+    }
+    return [[x1, y1], [x2, y2]];
+  }
+  function connectorMid(el) {
+    const p = connectorPath(el);
+    if (el.route === 'elbow') return [(p[2][0] + p[3][0]) / 2, (p[2][1] + p[3][1]) / 2];
+    return p[Math.floor(p.length / 2)].slice(0, 2).map((v, i) => (p.length === 2 ? (p[0][i] + p[1][i]) / 2 : v));
+  }
+
+  // The box arrows attach to: for icons with a name underneath it includes the name,
+  // so lines never run through the label.
+  function connectBox(el) {
+    const b = boxOf(el);
+    const def = el.type === 'shape' && SHAPES[el.kind];
+    if (el.label && def && def.labelBelow) return { ...b, h: b.h + (el.labelSize || 18) * 1.25 * el.label.split('\n').length + el.size + 6 };
+    return b;
+  }
+
+  // Recomputes the bound ends of one connector. Returns a new object, or the same one if unchanged.
+  function resolveConnector(el, byId) {
+    const A = el.from && byId.get(el.from.id), B = el.to && byId.get(el.to.id);
+    const ba = A && connectBox(A), bb = B && connectBox(B);
+    const ca = ba ? [ba.x + ba.w / 2, ba.y + ba.h / 2] : [el.x1, el.y1];
+    const cb = bb ? [bb.x + bb.w / 2, bb.y + bb.h / 2] : [el.x2, el.y2];
+    let p1 = [el.x1, el.y1], p2 = [el.x2, el.y2], n1, n2;
+    if (ba) { const e = boxExit(ba, cb[0], cb[1], el.route); p1 = [e[0], e[1]]; n1 = [e[2], e[3]]; }
+    if (bb) { const e = boxExit(bb, ca[0], ca[1], el.route); p2 = [e[0], e[1]]; n2 = [e[2], e[3]]; }
+    // A free end points toward the other end.
+    const dx = p2[0] - p1[0], dy = p2[1] - p1[1];
+    const axis = Math.abs(dx) >= Math.abs(dy);
+    if (!n1) n1 = axis ? [Math.sign(dx) || 1, 0] : [0, Math.sign(dy) || 1];
+    if (!n2) n2 = axis ? [-(Math.sign(dx) || 1), 0] : [0, -(Math.sign(dy) || 1)];
+    const from = A ? el.from : null, to = B ? el.to : null;
+    if (p1[0] === el.x1 && p1[1] === el.y1 && p2[0] === el.x2 && p2[1] === el.y2 && from === el.from && to === el.to &&
+        el.n1 && el.n2 && n1[0] === el.n1[0] && n1[1] === el.n1[1] && n2[0] === el.n2[0] && n2[1] === el.n2[1]) return el;
+    return { ...el, x1: p1[0], y1: p1[1], x2: p2[0], y2: p2[1], n1, n2, from, to };
   }
 
   function hexA(color, a) {
@@ -195,12 +368,57 @@
     } else {
       ctx.lineWidth = el.size;
       ctx.beginPath();
-      ctx.moveTo(p[0][0], p[0][1]);
-      for (let i = 1; i < p.length - 1; i++) {
-        ctx.quadraticCurveTo(p[i][0], p[i][1], (p[i][0] + p[i + 1][0]) / 2, (p[i][1] + p[i + 1][1]) / 2);
-      }
-      ctx.lineTo(p[p.length - 1][0], p[p.length - 1][1]);
+      splinePath(ctx, p);
       ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // Catmull-Rom spline through every point, drawn as cubic Béziers: smooth curves without corners.
+  function splinePath(ctx, p) {
+    ctx.moveTo(p[0][0], p[0][1]);
+    if (p.length === 2) { ctx.lineTo(p[1][0], p[1][1]); return; }
+    for (let i = 0; i < p.length - 1; i++) {
+      const p0 = p[i - 1] || p[i], p1 = p[i], p2 = p[i + 1], p3 = p[i + 2] || p2;
+      ctx.bezierCurveTo(
+        p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6,
+        p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6,
+        p2[0], p2[1]
+      );
+    }
+  }
+
+  function drawConnector(ctx, el) {
+    const pts = connectorPath(el);
+    ctx.save();
+    ctx.strokeStyle = ctx.fillStyle = el.color;
+    ctx.lineWidth = el.size;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    if (el.dash) ctx.setLineDash([el.size * 3, el.size * 2.5]);
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const n = pts.length;
+    if (el.endArrow) arrowHead(ctx, pts[n - 2][0], pts[n - 2][1], pts[n - 1][0], pts[n - 1][1], el.size);
+    if (el.startArrow) arrowHead(ctx, pts[1][0], pts[1][1], pts[0][0], pts[0][1], el.size);
+    if (el.label) {
+      const fs = el.labelSize || 16;
+      const [mx, my] = connectorMid(el);
+      ctx.font = `${fs}px ${FONTS.sans}`;
+      const lines = el.label.split('\n');
+      const w = Math.max(...lines.map((l) => ctx.measureText(l).width)) + fs * 0.8;
+      const h = lines.length * fs * 1.25 + fs * 0.4;
+      ctx.fillStyle = 'rgba(255,255,255,0.92)';
+      ctx.beginPath();
+      ctx.roundRect(mx - w / 2, my - h / 2, w, h, fs * 0.3);
+      ctx.fill();
+      ctx.fillStyle = el.color;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      lines.forEach((ln, i) => ctx.fillText(ln, mx, my + (i - (lines.length - 1) / 2) * fs * 1.25));
     }
     ctx.restore();
   }
@@ -425,6 +643,18 @@
       },
     },
     table: { name: 'Table', draw: (c, g, el) => drawTable(c, g, el) },
+    frame: {
+      name: 'Frame / boundary (e.g. VPC, Backend)',
+      labelPos: 'top',
+      defaultLabel: 'Frame',
+      draw: (c, g, el) => {
+        c.save();
+        c.fillStyle = hexA(el.color, el.fill === 'none' ? 0.04 : 0.1);
+        c.beginPath(); c.roundRect(g.x, g.y, g.w, g.h, Math.min(16, g.w / 10, g.h / 10)); c.fill();
+        c.restore();
+        c.beginPath(); c.roundRect(g.x, g.y, g.w, g.h, Math.min(16, g.w / 10, g.h / 10)); c.stroke();
+      },
+    },
   };
 
   const SHAPE_GROUPS = [
@@ -433,7 +663,7 @@
     { name: 'Flowchart', items: ['terminator', 'process', 'decision', 'io', 'predefined', 'document', 'preparation', 'connector', 'database'] },
     { name: 'Logic gates', items: ['and', 'or', 'not', 'nand', 'nor', 'xor', 'xnor'] },
     { name: 'Network / ICT', items: ['computer', 'laptop', 'server', 'router', 'switch', 'firewall', 'cloud', 'user', 'phone', 'printer', 'chip'] },
-    { name: 'Table', items: ['table'] },
+    { name: 'Frames & tables', items: ['frame', 'table'] },
   ];
   // Default box for a shape placed with a single click (world units at zoom 1).
   const DEFAULT_SIZE = {
@@ -441,7 +671,18 @@
     computer: [120, 110], laptop: [130, 90], server: [90, 120], router: [120, 90], switch: [150, 70], firewall: [110, 90],
     cloud: [170, 110], user: [80, 100], phone: [60, 110], printer: [110, 100], chip: [100, 100], database: [100, 120],
     connector: [60, 60], terminator: [170, 70], decision: [170, 110], line: [160, 0], arrow: [160, 0], dblarrow: [160, 0],
+    frame: [420, 280],
   };
+
+  // Lets extra shape libraries (shapes-arch.js) plug in: defs, picker groups and default sizes.
+  // Network icons show their name underneath (a label inside a monitor or router is unreadable).
+  ['computer', 'laptop', 'server', 'router', 'switch', 'firewall', 'user', 'phone', 'printer', 'chip'].forEach((k) => { SHAPES[k].labelBelow = true; });
+
+  function registerShapes(defs, groups, sizes) {
+    Object.assign(SHAPES, defs);
+    SHAPE_GROUPS.push(...groups);
+    Object.assign(DEFAULT_SIZE, sizes);
+  }
 
   function gate(c, g, kind, bubble) {
     const { x, y, w, h, cy } = g;
@@ -539,19 +780,46 @@
         for (const s of segs) { ctx.moveTo(s[0], s[1]); ctx.lineTo(s[2], s[3]); }
         ctx.stroke();
       },
+      // Small text drawn as part of an icon, e.g. "λ" or "{ }".
+      text(str, tx, ty, size, weight = 600) {
+        ctx.save();
+        ctx.setLineDash([]);
+        ctx.font = `${weight} ${size}px ${FONTS.sans}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = el.fill === 'solid' ? (isDarkColor(el.color) ? '#ffffff' : '#111111') : el.color;
+        ctx.fillText(str, tx, ty);
+        ctx.restore();
+      },
+      dot(dx, dy, r) { ctx.beginPath(); ctx.arc(dx, dy, r, 0, TAU); ctx.fill(); },
     };
     def.draw(ctx, g, el);
 
-    if (el.label) {
+    if (el.label && !def.ownLabel) {
       const fs = el.labelSize || 20;
-      ctx.setLineDash([]);
-      ctx.font = `${fs}px ${FONTS.sans}`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillStyle = el.fill === 'solid' ? (isDarkColor(el.color) ? '#ffffff' : '#111111') : el.color;
       const lines = el.label.split('\n');
       const lh = fs * 1.25;
-      lines.forEach((ln, i) => ctx.fillText(ln, g.cx, g.cy + (i - (lines.length - 1) / 2) * lh));
+      ctx.setLineDash([]);
+      if (def.labelPos === 'top') {
+        // Frame title: bold, top-left inside the frame.
+        ctx.font = `600 ${fs}px ${FONTS.sans}`;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        ctx.fillStyle = el.color;
+        lines.forEach((ln, i) => ctx.fillText(ln, x + fs * 0.6, y + fs * 0.5 + i * lh));
+      } else if (def.labelBelow) {
+        ctx.font = `${fs}px ${FONTS.sans}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillStyle = el.color;
+        lines.forEach((ln, i) => ctx.fillText(ln, g.cx, y + h + el.size + 6 + i * lh));
+      } else {
+        ctx.font = `${fs}px ${FONTS.sans}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = el.fill === 'solid' ? (isDarkColor(el.color) ? '#ffffff' : '#111111') : el.color;
+        lines.forEach((ln, i) => ctx.fillText(ln, g.cx, g.cy + (i - (lines.length - 1) / 2) * lh));
+      }
     }
     ctx.restore();
   }
@@ -638,6 +906,7 @@
     if (el.type === 'stroke') drawStroke(ctx, el);
     else if (el.type === 'shape') drawShape(ctx, el);
     else if (el.type === 'text') drawText(ctx, el);
+    else if (el.type === 'connector') drawConnector(ctx, el);
     else if (el.type === 'image') {
       const rec = getImage(el.src, onImageLoad);
       if (rec.ready) ctx.drawImage(rec.img, el.x, el.y, el.w, el.h);
@@ -653,6 +922,7 @@
     ctx.fillRect(0, 0, w, h);
     if (!bg.pattern) return;
     let step = 40 * view.zoom;
+    if (!(step > 0 && Number.isFinite(step))) return;
     while (step < 14) step *= 2;
     const ox = (-view.x * view.zoom) % step, oy = (-view.y * view.zoom) % step;
     ctx.save();
@@ -715,13 +985,31 @@
       canvas.addEventListener('contextmenu', (e) => e.preventDefault());
       if (this.mode === 'infinite') canvas.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
 
+      // Older files have no element ids; connectors need them.
+      this.doc.pages.forEach((p) => p.elements.forEach(ensureId));
+
       this.ro = new ResizeObserver(() => this.resize());
       this.ro.observe(canvas);
       Board.all.add(this);
       this.updateCursor();
     }
 
-    destroy() { this.ro.disconnect(); this.cancelText(); Board.all.delete(this); }
+    destroy() { this.ro.disconnect(); this.cancelText(); this.hideSelBar(); Board.all.delete(this); }
+
+    // Frees the canvas memory (PDF pages far off screen). resize() brings it back.
+    release() {
+      this.cancelText();
+      this.hideSelBar();
+      this.canvas.width = this.canvas.height = 0;
+      this.base.width = this.base.height = 0;
+      this.cssW = this.cssH = 0;
+      this.released = true;
+    }
+    restore() {
+      if (!this.released) return;
+      this.released = false;
+      this.resize();
+    }
 
     get page() { return this.doc.pages[this.pageIndex]; }
     get els() { return this.page.elements; }
@@ -734,6 +1022,10 @@
       ctx.setTransform(k, 0, 0, k, -this.view.x * k, -this.view.y * k);
     }
     setView(v) {
+      // Never accept a zero / negative / NaN zoom: the background grid loop would never end.
+      if ('zoom' in v && !(v.zoom > 0 && Number.isFinite(v.zoom))) return;
+      if (('x' in v && !Number.isFinite(v.x)) || ('y' in v && !Number.isFinite(v.y))) return;
+      if ('zoom' in v) v = { ...v, zoom: Math.min(8, Math.max(0.05, v.zoom)) };
       Object.assign(this.view, v);
       this.dirty = true;
       this.requestDraw();
@@ -754,6 +1046,7 @@
     }
 
     resize() {
+      if (this.released) return;
       const w = this.canvas.clientWidth, h = this.canvas.clientHeight;
       if (!w || !h) return;
       this.dpr = window.devicePixelRatio || 1;
@@ -821,6 +1114,48 @@
     changed() { if (this.opts.onChange) this.opts.onChange(this); }
     invalidate() { this.dirty = true; this.requestDraw(); }
 
+    // Re-attaches connector ends to the shapes they are bound to (after any move / resize / undo).
+    syncConnectors(els = this.els) {
+      if (!els.some((e) => e.type === 'connector')) return;
+      const byId = new Map();
+      for (const e of els) if (e.id && e.type !== 'connector') byId.set(e.id, e);
+      for (let i = 0; i < els.length; i++) {
+        const e = els[i];
+        if (e.type !== 'connector') continue;
+        const r = resolveConnector(e, byId);
+        if (r === e) continue;
+        els[i] = r;
+        const si = this.sel.indexOf(e);
+        if (si >= 0) this.sel[si] = r;
+      }
+    }
+
+    // Adds a new element (with id) and makes it the selection.
+    insert(el, { select = true, behind = false } = {}) {
+      ensureId(el);
+      this.pushHistory();
+      if (behind) this.els.unshift(el); else this.els.push(el);
+      if (select) this.sel = [el];
+      this.invalidate();
+      this.changed();
+      return el;
+    }
+
+    // Adds a ready-made group of elements (templates). Ids are remapped so it can be inserted twice.
+    insertElements(list, at) {
+      const b = unionBox(list.filter((e) => e.type !== 'connector'));
+      if (!b) return;
+      const [cx, cy] = at || this.viewCenter();
+      const dx = cx - (b.x + b.w / 2), dy = cy - (b.y + b.h / 2);
+      const copies = remapIds(list.map((e) => mapEl(e, (x, y) => [x + dx, y + dy], 1)));
+      this.pushHistory();
+      // Frames go behind everything else.
+      this.page.elements = [...copies.filter((e) => e.kind === 'frame'), ...this.els, ...copies.filter((e) => e.kind !== 'frame')];
+      this.sel = copies;
+      this.invalidate();
+      this.changed();
+    }
+
     // ----- adding content -----
     viewCenter() { return this.toWorld(this.cssW / 2, this.cssH / 2); }
 
@@ -831,24 +1166,14 @@
       const s = Math.min(1 / z, maxW / img.naturalWidth, maxH / img.naturalHeight);
       const w = img.naturalWidth * s, h = img.naturalHeight * s;
       const [cx, cy] = at || this.viewCenter();
-      const el = { type: 'image', src, x: cx - w / 2, y: cy - h / 2, w, h };
-      this.pushHistory();
-      this.els.push(el);
-      this.sel = [el];
-      this.invalidate();
-      this.changed();
-      return el;
+      return this.insert({ type: 'image', src, x: cx - w / 2, y: cy - h / 2, w, h });
     }
 
     addText(text, extra = {}) {
       const [cx, cy] = this.viewCenter();
       const el = this.makeText(text, cx, cy, extra);
       el.x -= el.w / 2; el.y -= el.h / 2;
-      this.pushHistory();
-      this.els.push(el);
-      this.sel = [el];
-      this.invalidate();
-      this.changed();
+      this.insert(el);
     }
 
     makeText(text, x, y, extra = {}) {
@@ -861,7 +1186,7 @@
         ...extra,
       };
       Object.assign(el, measureText(this.ctx, el));
-      return el;
+      return ensureId(el);
     }
 
     // ----- selection operations -----
@@ -885,7 +1210,7 @@
     pasteElements(offset = 24) {
       if (!clipboardEls) return false;
       const d = offset / this.view.zoom;
-      const copies = clipboardEls.map((e) => mapEl(e, (x, y) => [x + d, y + d], 1));
+      const copies = remapIds(clipboardEls.map((e) => mapEl(e, (x, y) => [x + d, y + d], 1)));
       this.pushHistory();
       this.els.push(...copies);
       this.sel = copies;
@@ -911,6 +1236,42 @@
       this.replaceSel((e) => mapEl(e, (x, y) => [x + dx / this.view.zoom, y + dy / this.view.zoom], 1));
       this.changed();
     }
+
+    // Align / distribute the selected elements (connectors follow on their own).
+    alignSelection(mode) {
+      const items = this.sel.filter((e) => e.type !== 'connector');
+      if (items.length < 2) return;
+      const all = unionBox(items);
+      const boxes = new Map(items.map((e) => [e, bbox(e)]));
+      const move = new Map();
+      if (mode === 'disth' || mode === 'distv') {
+        const h = mode === 'disth';
+        const sorted = items.slice().sort((a, b) => (h ? boxes.get(a).x - boxes.get(b).x : boxes.get(a).y - boxes.get(b).y));
+        const total = sorted.reduce((s, e) => s + (h ? boxes.get(e).w : boxes.get(e).h), 0);
+        const gap = ((h ? all.w : all.h) - total) / (sorted.length - 1);
+        let pos = h ? all.x : all.y;
+        for (const e of sorted) {
+          const b = boxes.get(e);
+          move.set(e, h ? [pos - b.x, 0] : [0, pos - b.y]);
+          pos += (h ? b.w : b.h) + gap;
+        }
+      } else {
+        for (const e of items) {
+          const b = boxes.get(e);
+          const d = {
+            left: [all.x - b.x, 0], hcenter: [all.x + all.w / 2 - (b.x + b.w / 2), 0], right: [all.x + all.w - (b.x + b.w), 0],
+            top: [0, all.y - b.y], vmiddle: [0, all.y + all.h / 2 - (b.y + b.h / 2)], bottom: [0, all.y + all.h - (b.y + b.h)],
+          }[mode];
+          move.set(e, d);
+        }
+      }
+      this.pushHistory();
+      this.replaceSel((e) => {
+        const d = move.get(e);
+        return d ? mapEl(e, (x, y) => [x + d[0], y + d[1]], 1) : e;
+      });
+      this.changed();
+    }
     // Apply tool style changes (colour, size, fill...) to the current selection.
     applyStyle(patch) {
       if (!this.sel.length) return false;
@@ -918,9 +1279,14 @@
       this.replaceSel((e) => {
         const c = { ...e };
         if (patch.color && e.type !== 'image' && !(e.type === 'text' && e.style === 'code')) c.color = patch.color;
-        if (patch.size && (e.type === 'stroke' || e.type === 'shape')) c.size = (patch.size / this.view.zoom) * (e.alpha < 1 ? 4 : 1);
+        if (patch.size && (e.type === 'stroke' || e.type === 'shape' || e.type === 'connector')) c.size = (patch.size / this.view.zoom) * (e.alpha < 1 ? 4 : 1);
         if (patch.fill && e.type === 'shape') c.fill = patch.fill;
-        if ('dash' in patch && e.type === 'shape') c.dash = patch.dash;
+        if ('dash' in patch && (e.type === 'shape' || e.type === 'connector')) c.dash = patch.dash;
+        if (e.type === 'connector') {
+          if (patch.route) c.route = patch.route;
+          if ('startArrow' in patch) c.startArrow = patch.startArrow;
+          if ('endArrow' in patch) c.endArrow = patch.endArrow;
+        }
         if (e.type === 'text') {
           if (patch.fontSize) c.fontSize = patch.fontSize / this.view.zoom;
           if (patch.font) c.font = patch.font;
@@ -1001,6 +1367,18 @@
             alpha: hl ? 0.35 : 1,
           };
           if (!hl && e.pointerType === 'pen') this.temp.pressure = true;
+          this.action.raw = [wx, wy, e.pressure || 0.5];
+          break;
+        }
+        case 'connector': {
+          const from = this.boxAt(wx, wy);
+          const [px, py] = from ? [wx, wy] : this.snapPt(wx, wy);
+          this.temp = {
+            type: 'connector', from: from ? { id: ensureId(from).id } : null, to: null,
+            x1: px, y1: py, x2: px, y2: py,
+            route: Tools.route, startArrow: Tools.startArrow, endArrow: Tools.endArrow,
+            color: Tools.color, size: Math.max(1, Tools.size) / z, dash: Tools.dash,
+          };
           break;
         }
         case 'eraser':
@@ -1011,18 +1389,18 @@
           this.laser.push({ x: wx, y: wy, t: performance.now(), start: true });
           this.animateLaser();
           break;
-        case 'shape':
+        case 'shape': {
+          const [px, py] = this.snapPt(wx, wy);
           this.temp = {
-            type: 'shape', kind: Tools.shape, x1: wx, y1: wy, x2: wx, y2: wy,
+            type: 'shape', kind: Tools.shape, x1: px, y1: py, x2: px, y2: py,
             color: Tools.color, size: Math.max(1, Tools.size) / z, fill: Tools.fill, dash: Tools.dash,
           };
           if (Tools.shape === 'table') { this.temp.rows = Tools.tableRows; this.temp.cols = Tools.tableCols; }
           break;
+        }
         case 'text': {
           const hit = this.hitTest(wx, wy, 4 / z);
-          if (hit && hit.type === 'text') this.openTextEditor(hit);
-          else if (hit && hit.type === 'shape' && !LINE_KINDS.has(hit.kind) && hit.kind !== 'table') this.openLabelEditor(hit);
-          else this.openTextEditor(null, wx, wy);
+          if (!this.editLabelOf(hit)) this.openTextEditor(null, wx, wy);
           this.action = null;
           break;
         }
@@ -1057,6 +1435,11 @@
       const a = this.action;
       if (!a) {
         if (Tools.tool === 'eraser' || Tools.tool === 'laser') this.requestDraw();
+        if (Tools.tool === 'connector') {
+          const [hx, hy] = this.toWorld(sx, sy);
+          const hb = this.boxAt(hx, hy);
+          if (hb !== this.hoverBox) { this.hoverBox = hb; this.requestDraw(); }
+        }
         if (Tools.tool === 'select') this.canvas.style.cursor = this.handleHit(sx, sy) ? 'nwse-resize' : 'default';
         return;
       }
@@ -1089,14 +1472,28 @@
         case 'pen':
         case 'highlighter': {
           if (!this.temp) break;
+          // Stabiliser: each point moves only part of the way toward the pointer, which irons
+          // out touchpad / mouse jitter. k = 0 is raw input.
+          const k = Math.min(0.9, (Tools.smoothing / 100) * 0.85);
           const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
           for (const ce of evs.length ? evs : [e]) {
-            const [x, y] = this.toWorld(ce.clientX - rect.left, ce.clientY - rect.top);
+            const [rx, ry] = this.toWorld(ce.clientX - rect.left, ce.clientY - rect.top);
+            a.raw = [rx, ry, ce.pressure || 0.5];
             const last = this.temp.pts[this.temp.pts.length - 1];
+            const x = last[0] + (rx - last[0]) * (1 - k), y = last[1] + (ry - last[1]) * (1 - k);
             if (Math.hypot(x - last[0], y - last[1]) * z < 1.2) continue;
             this.temp.pts.push([x, y, ce.pressure || 0.5]);
           }
           if (e.shiftKey && this.temp.pts.length > 1) this.temp.pts = [this.temp.pts[0], [wx, wy, 0.5]]; // straight line
+          break;
+        }
+        case 'connector': {
+          if (!this.temp) break;
+          const target = this.boxAt(wx, wy, this.temp.from && this.temp.from.id);
+          this.hoverBox = target;
+          const [px, py] = target ? [wx, wy] : this.snapPt(wx, wy);
+          this.temp = { ...this.temp, x2: px, y2: py, to: target ? { id: ensureId(target).id } : null };
+          this.temp = this.resolveTemp(this.temp);
           break;
         }
         case 'eraser': {
@@ -1109,7 +1506,7 @@
           break;
         case 'shape': {
           if (!this.temp) break;
-          let x2 = wx, y2 = wy;
+          let [x2, y2] = this.snapPt(wx, wy);
           if (e.shiftKey) {
             const dx = wx - this.temp.x1, dy = wy - this.temp.y1;
             if (LINE_KINDS.has(this.temp.kind)) {
@@ -1135,31 +1532,43 @@
       this.requestDraw();
     }
 
-    beginTransform(a) {
+    beginTransform(a, withContents) {
       if (a.originals) return;
       this.pushHistory();
       a.originals = this.sel.slice();
-      a.indexes = this.sel.map((el) => this.els.indexOf(el));
+      a.selCount = a.originals.length;
+      // Moving a frame carries everything inside it along.
+      if (withContents) {
+        const frames = this.sel.filter((e) => e.kind === 'frame');
+        const inside = this.els.filter((e) => !this.sel.includes(e) && e.type !== 'connector' &&
+          frames.some((f) => { const fb = boxOf(f), b = bbox(e); return b.x >= fb.x && b.y >= fb.y && b.x + b.w <= fb.x + fb.w && b.y + b.h <= fb.y + fb.h; }));
+        a.originals.push(...inside);
+      }
+      a.indexes = a.originals.map((el) => this.els.indexOf(el));
+      a.box0 = unionBox(a.originals.slice(0, a.selCount));
     }
     applyTransform(a, f, s) {
       const els = this.els;
-      this.sel = a.originals.map((el, k) => {
+      const mapped = a.originals.map((el, k) => {
         const c = mapEl(el, f, s);
         if (a.indexes[k] >= 0) els[a.indexes[k]] = c;
         return c;
       });
+      this.sel = mapped.slice(0, a.selCount);
       this.dirty = true;
     }
     dragMove(a, wx, wy) {
       if (!this.sel.length) return;
       if (!a.originals && Math.hypot(wx - a.wx, wy - a.wy) * this.view.zoom < 2) return;
-      this.beginTransform(a);
-      const dx = wx - a.wx, dy = wy - a.wy;
+      this.beginTransform(a, true);
+      let dx = wx - a.wx, dy = wy - a.wy;
+      if (Tools.snap && a.box0) { dx = snapV(a.box0.x + dx) - a.box0.x; dy = snapV(a.box0.y + dy) - a.box0.y; }
       this.applyTransform(a, (x, y) => [x + dx, y + dy], 1);
     }
     dragResize(a, wx, wy, free) {
       this.beginTransform(a);
       const b = a.b0;
+      if (Tools.snap) [wx, wy] = this.snapPt(wx, wy);
       let sx = Math.max(0.05, (wx - b.x) / b.w), sy = Math.max(0.05, (wy - b.y) / b.h);
       const keepAspect = !free && a.originals.some((e) => e.type === 'image' || e.type === 'text');
       if (keepAspect) sx = sy = Math.max(sx, sy);
@@ -1178,28 +1587,40 @@
         case 'pen':
         case 'highlighter':
           if (this.temp) {
-            this.pushHistory();
-            this.els.push(this.temp);
+            const t = this.temp;
             this.temp = null;
-            this.invalidate();
-            this.changed();
+            // Finish exactly where the pen lifted, then drop redundant points.
+            const last = t.pts[t.pts.length - 1];
+            if (a.raw && t.pts.length > 1 && Math.hypot(a.raw[0] - last[0], a.raw[1] - last[1]) * this.view.zoom > 0.5) t.pts.push(a.raw);
+            if (Tools.smoothing > 0) t.pts = relax(t.pts, Math.round(Tools.smoothing / 20));
+            if (!t.pressure && t.pts.length > 3) t.pts = simplify(t.pts, 0.35 / this.view.zoom);
+            this.insert(t, { select: false });
           }
           break;
+        case 'connector': {
+          const t = this.temp;
+          this.temp = null;
+          this.hoverBox = null;
+          if (!t) break;
+          if (!t.to && Math.hypot(t.x2 - t.x1, t.y2 - t.y1) * this.view.zoom < 8) { this.requestDraw(); break; }
+          this.insert(t, { select: false });
+          break;
+        }
         case 'shape': {
           const t = this.temp;
           this.temp = null;
           if (!t) break;
           const z = this.view.zoom;
+          const def = SHAPES[t.kind] || {};
           if (Math.abs(t.x2 - t.x1) * z < 6 && Math.abs(t.y2 - t.y1) * z < 6) {
             // single click: drop a default-sized shape
             let [dw, dh] = DEFAULT_SIZE[t.kind] || [160, 110];
             if (t.kind === 'table') { dw = t.cols * 90; dh = t.rows * 44; }
             t.x2 = t.x1 + dw / z; t.y2 = t.y1 + dh / z;
+            if (Tools.snap) { t.x2 = snapV(t.x2); t.y2 = snapV(t.y2); }
           }
-          this.pushHistory();
-          this.els.push(t);
-          this.invalidate();
-          this.changed();
+          if (def.defaultLabel) { t.label = def.defaultLabel; t.labelSize = (t.kind === 'frame' ? 20 : 17) / z; }
+          this.insert(t, { select: false, behind: t.kind === 'frame' });
           break;
         }
         case 'eraser':
@@ -1223,10 +1644,39 @@
       if (Tools.tool !== 'select') return;
       const rect = this.canvas.getBoundingClientRect();
       const [wx, wy] = this.toWorld(e.clientX - rect.left, e.clientY - rect.top);
-      const hit = this.hitTest(wx, wy, 4 / this.view.zoom);
-      if (!hit) return;
+      this.editLabelOf(this.hitTest(wx, wy, 4 / this.view.zoom));
+    }
+
+    // Opens the right text editor for an element: text, shape label or connector label.
+    editLabelOf(hit) {
+      if (!hit) return false;
       if (hit.type === 'text') this.openTextEditor(hit);
       else if (hit.type === 'shape' && !LINE_KINDS.has(hit.kind) && hit.kind !== 'table') this.openLabelEditor(hit);
+      else if (hit.type === 'connector') this.openLabelEditor(hit);
+      else return false;
+      return true;
+    }
+
+    // The topmost box-like element (shape, image, text) under a point, for attaching connectors.
+    boxAt(wx, wy, exceptId) {
+      for (let i = this.els.length - 1; i >= 0; i--) {
+        const e = this.els[i];
+        if (!isBox(e) || e.id === exceptId) continue;
+        const b = boxOf(e);
+        if (inBox(b, wx, wy, 6 / this.view.zoom)) {
+          // A frame only counts near its edge, so you can still connect the boxes inside it.
+          if (e.kind === 'frame' && !hitEl(e, wx, wy, 6 / this.view.zoom)) continue;
+          return e;
+        }
+      }
+      return null;
+    }
+
+    snapPt(wx, wy) { return Tools.snap ? [snapV(wx), snapV(wy)] : [wx, wy]; }
+
+    resolveTemp(t) {
+      const byId = new Map(this.els.filter((e) => e.id).map((e) => [e.id, e]));
+      return resolveConnector(t, byId);
     }
 
     onWheel(e) {
@@ -1352,9 +1802,18 @@
     openLabelEditor(shape) {
       this.cancelText();
       const z = this.view.zoom;
-      const x = Math.min(shape.x1, shape.x2), y = Math.min(shape.y1, shape.y2);
-      const w = Math.abs(shape.x2 - shape.x1), h = Math.abs(shape.y2 - shape.y1);
-      const fs = shape.labelSize || Math.min(Tools.fontSize * 0.8, 24) / z;
+      let x = Math.min(shape.x1, shape.x2), y = Math.min(shape.y1, shape.y2);
+      let w = Math.abs(shape.x2 - shape.x1), h = Math.abs(shape.y2 - shape.y1);
+      const def = SHAPES[shape.kind] || {};
+      const fs = shape.labelSize || Math.min(Tools.fontSize * 0.8, shape.type === 'connector' ? 18 : 24) / z;
+      if (shape.type === 'connector') {
+        const [mx, my] = connectorMid(shape);
+        w = 200 / z; h = fs * 2.6; x = mx - w / 2; y = my - h / 2;
+      } else if (def.labelPos === 'top') {
+        h = fs * 2.4;
+      } else if (def.labelBelow) {
+        y += h + 4 / z; h = fs * 2.6; x -= w * 0.4; w *= 1.8;
+      }
       const ta = document.createElement('textarea');
       ta.className = 'tb-text-editor tb-label-editor';
       ta.value = shape.label || '';
@@ -1419,7 +1878,7 @@
     }
 
     updateCursor() {
-      const map = { select: 'default', hand: 'grab', pen: 'crosshair', highlighter: 'crosshair', eraser: 'none', laser: 'none', text: 'text', shape: 'crosshair' };
+      const map = { select: 'default', hand: 'grab', pen: 'crosshair', highlighter: 'crosshair', eraser: 'none', laser: 'none', text: 'text', shape: 'crosshair', connector: 'crosshair' };
       this.canvas.style.cursor = map[Tools.tool] || 'default';
       if (Tools.tool !== 'select' && this.sel.length) { this.sel = []; }
       this.requestDraw();
@@ -1432,6 +1891,7 @@
     }
 
     renderBase() {
+      this.syncConnectors();
       const b = this.base.getContext('2d');
       b.setTransform(1, 0, 0, 1, 0, 0);
       b.clearRect(0, 0, this.base.width, this.base.height);
@@ -1461,6 +1921,17 @@
 
       ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
       const z = this.view.zoom;
+      if (this.hoverBox && Tools.tool === 'connector') {
+        // Shows which box the connector will attach to.
+        const hb = boxOf(this.hoverBox);
+        const [x, y] = this.toScreen(hb.x, hb.y);
+        ctx.save();
+        ctx.strokeStyle = '#22c55e';
+        ctx.lineWidth = 2.5;
+        ctx.strokeRect(x - 5, y - 5, hb.w * z + 10, hb.h * z + 10);
+        ctx.restore();
+      }
+      this.updateSelBar();
       if (this.sel.length) {
         const b = this.selBox();
         const [x, y] = this.toScreen(b.x, b.y);
@@ -1530,24 +2001,87 @@
       ctx.restore();
     }
 
+    // ----- selection toolbar (align, order, duplicate, delete) -----
+    updateSelBar() {
+      const show = this.sel.length > 0 && Tools.tool === 'select' && !this.action && !this.textEditor && window.icon;
+      if (!show) { this.hideSelBar(); return; }
+      if (!this.selBar) {
+        const bar = document.createElement('div');
+        bar.className = 'tb-selbar';
+        const b = (act, ic, title) => `<button data-sel="${act}" title="${title}">${window.icon(ic, 16)}</button>`;
+        bar.innerHTML = `<span class="tb-align">
+            ${b('left', 'alignleft', 'Align left')}${b('hcenter', 'aligncenter', 'Align centre')}${b('right', 'alignright', 'Align right')}
+            ${b('top', 'aligntop', 'Align top')}${b('vmiddle', 'alignmiddle', 'Align middle')}${b('bottom', 'alignbottom', 'Align bottom')}
+            ${b('disth', 'disth', 'Space evenly (horizontal)')}${b('distv', 'distv', 'Space evenly (vertical)')}<i></i></span>
+          ${b('front', 'front', 'Bring to front')}${b('back', 'back2', 'Send to back')}${b('dup', 'copy', 'Duplicate (Ctrl D)')}${b('del', 'trash', 'Delete')}`;
+        bar.addEventListener('pointerdown', (e) => e.stopPropagation());
+        bar.addEventListener('click', (e) => {
+          const btn = e.target.closest('[data-sel]');
+          if (!btn) return;
+          const act = btn.dataset.sel;
+          if (act === 'front' || act === 'back') this.reorderSelection(act === 'front');
+          else if (act === 'dup') this.duplicateSelection();
+          else if (act === 'del') this.deleteSelection();
+          else this.alignSelection(act);
+        });
+        this.canvas.parentElement.appendChild(bar);
+        this.selBar = bar;
+      }
+      const bar = this.selBar;
+      bar.querySelector('.tb-align').hidden = this.sel.filter((e) => e.type !== 'connector').length < 2;
+      const sb = this.selBox();
+      const [x, y] = this.toScreen(sb.x + sb.w / 2, sb.y);
+      const bw = bar.offsetWidth || 300;
+      const left = Math.max(4, Math.min(this.cssW - bw - 4, x - bw / 2));
+      const top = y - 52 < 4 ? this.toScreen(0, sb.y + sb.h)[1] + 16 : y - 52;
+      bar.style.left = this.canvas.offsetLeft + left + 'px';
+      bar.style.top = this.canvas.offsetTop + Math.min(top, this.cssH - 44) + 'px';
+    }
+    hideSelBar() { if (this.selBar) { this.selBar.remove(); this.selBar = null; } }
+
     // ----- export -----
     // Renders one page's content (cropped to content) to a new canvas.
+    // The scale is lowered for very large boards: browsers cannot make canvases bigger than
+    // about 16k px per side, and that used to make export fail silently.
     async exportPage(pageIndex = this.pageIndex, scale = 2, withBg = true) {
       const els = this.doc.pages[pageIndex].elements;
+      this.syncConnectors(els);
       const b = unionBox(els);
       if (!b) return null;
       await Promise.all(els.filter((e) => e.type === 'image').map((e) => loadImage(e.src).catch(() => null)));
       const pad = 40;
-      const c = document.createElement('canvas');
-      c.width = Math.ceil((b.w + pad * 2) * scale);
-      c.height = Math.ceil((b.h + pad * 2) * scale);
-      const ctx = c.getContext('2d');
-      const view = { x: b.x - pad, y: b.y - pad, zoom: scale };
-      if (withBg) drawBackground(ctx, this.doc.bg, view, c.width, c.height);
-      ctx.setTransform(scale, 0, 0, scale, -view.x * scale, -view.y * scale);
-      els.forEach((el) => drawElement(ctx, el));
-      return c;
+      const w = b.w + pad * 2, h = b.h + pad * 2;
+      scale = Math.min(scale, EXPORT_MAX_SIDE / w, EXPORT_MAX_SIDE / h, Math.sqrt(EXPORT_MAX_PIXELS / (w * h)));
+      return renderRegion({ x: b.x - pad, y: b.y - pad, w, h }, els, this.doc.bg, scale, withBg);
     }
+
+    // Renders exactly what is visible on screen right now.
+    async exportView(scale = 2) {
+      this.syncConnectors();
+      const r = { x: this.view.x, y: this.view.y, w: this.cssW / this.view.zoom, h: this.cssH / this.view.zoom };
+      await Promise.all(this.els.filter((e) => e.type === 'image').map((e) => loadImage(e.src).catch(() => null)));
+      scale = Math.min(scale * this.view.zoom, EXPORT_MAX_SIDE / r.w, EXPORT_MAX_SIDE / r.h);
+      return renderRegion(r, this.els, this.doc.bg, scale, true);
+    }
+  }
+
+  const EXPORT_MAX_SIDE = 8192;
+  const EXPORT_MAX_PIXELS = 40e6;
+  function renderRegion(r, els, bg, scale, withBg) {
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.ceil(r.w * scale));
+    c.height = Math.max(1, Math.ceil(r.h * scale));
+    const ctx = c.getContext('2d');
+    const view = { x: r.x, y: r.y, zoom: scale };
+    if (withBg) drawBackground(ctx, bg, view, c.width, c.height);
+    ctx.setTransform(scale, 0, 0, scale, -view.x * scale, -view.y * scale);
+    els.forEach((el) => drawElement(ctx, el));
+    return c;
+  }
+
+  // canvas.toBlob that rejects instead of silently handing back null.
+  function canvasToPng(c) {
+    return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error(`image too large (${c.width}×${c.height})`))), 'image/png'));
   }
 
   Board.all = new Set();
@@ -1555,6 +2089,8 @@
   // Draws a list of elements onto a canvas at a given world->pixel scale (used for PDF export).
   async function renderElementsTo(canvas, els, scale) {
     await Promise.all(els.filter((e) => e.type === 'image').map((e) => loadImage(e.src).catch(() => null)));
+    const byId = new Map(els.filter((e) => e.id).map((e) => [e.id, e]));
+    els = els.map((e) => (e.type === 'connector' ? resolveConnector(e, byId) : e));
     const ctx = canvas.getContext('2d');
     ctx.setTransform(scale, 0, 0, scale, 0, 0);
     els.forEach((el) => drawElement(ctx, el));
@@ -1580,7 +2116,7 @@
   }
 
   window.TB = {
-    Board, Tools, BACKGROUNDS, bgById, SHAPES, SHAPE_GROUPS, FONTS,
-    drawShapeIcon, renderElementsTo, loadImage, isDarkColor,
+    Board, Tools, BACKGROUNDS, bgById, SHAPES, SHAPE_GROUPS, DEFAULT_SIZE, FONTS,
+    drawShapeIcon, renderElementsTo, loadImage, isDarkColor, registerShapes, canvasToPng, uid, hexA,
   };
 })();

@@ -47,6 +47,7 @@
     }
     get iconHtml() { return icon('board', 16); }
     get board() { return null; }
+    sessionInfo() { return { type: 'home' }; }
     get usesTools() { return !!this.board; }
     setTitle(t) { this.title = t; App.renderTabs(); }
     setDirty(d) { if (this.dirty !== d) { this.dirty = d; App.renderTabs(); } }
@@ -156,15 +157,19 @@
 
   // ======================================================================
   class BoardTab extends TabBase {
-    constructor({ doc, filePath, title } = {}) {
+    constructor({ doc, filePath, title, autosaveId, dirty } = {}) {
       super('board', title || `Whiteboard ${++boardSeq}`);
       this.filePath = filePath || null;
+      // Every board is also auto-saved to the app data folder so a crash or reload loses nothing.
+      this.autosaveId = autosaveId || TB.uid();
+      this.dirty = !!dirty;
       this.el.innerHTML = `
         <div class="canvas-wrap">
           <canvas class="board"></canvas>
           <div class="board-bars">
           <div class="floating-bar bar-bottom-left">
             ${btn('bg', 'background', 'Background / page style')}
+            ${btn('snap', 'magnet', 'Snap to grid (keeps diagrams neat)')}
             <div class="bar-sep"></div>
             ${btn('zoomout', 'minus', 'Zoom out (Ctrl -)')}
             <span class="readout zoom" data-act="zoomreset" title="Reset zoom (Ctrl 0)">100%</span>
@@ -189,11 +194,10 @@
       this.board = new Board(canvas, {
         mode: 'infinite',
         doc: doc || { bg: 'white', pages: [{ elements: [] }] },
-        onChange: () => { this.setDirty(true); this.updateBar(); },
+        onChange: () => { this.setDirty(true); this.updateBar(); this.scheduleAutosave(); },
         onActivate: (b) => App.setActiveBoard(b),
         onView: () => this.updateBar(),
       });
-      this._board = this.board;
       this.el.addEventListener('click', (e) => {
         const b = e.target.closest('[data-act]');
         if (b) this.act(b.dataset.act, b);
@@ -212,10 +216,27 @@
       return new BoardTab({ doc: { bg: data.bg || 'white', pages: data.pages }, filePath, title: f.name.replace(/\.tboard$/i, '') });
     }
 
+    serialize() {
+      return JSON.stringify({ app: 'TeachBoard', version: 2, bg: this.board.doc.bg, pages: this.board.doc.pages });
+    }
+    scheduleAutosave() {
+      clearTimeout(this.autosaveTimer);
+      this.autosaveTimer = setTimeout(() => this.autosaveNow(), 1500);
+    }
+    autosaveNow() {
+      clearTimeout(this.autosaveTimer);
+      return window.api.autosaveWrite(this.autosaveId, this.serialize());
+    }
+    // What session restore needs to bring this tab back.
+    sessionInfo() {
+      return { type: 'board', autosaveId: this.autosaveId, filePath: this.filePath, title: this.title, dirty: this.dirty, page: this.board.pageIndex, view: { ...this.board.view } };
+    }
+
     updateBar() {
       const b = this.board;
       this.el.querySelector('.pages').textContent = `${b.pageIndex + 1} / ${b.doc.pages.length}`;
       this.el.querySelector('.zoom').textContent = Math.round(b.view.zoom * 100) + '%';
+      this.el.querySelector('[data-act=snap]').classList.toggle('on', !!Tools.snap);
     }
 
     async act(act, el) {
@@ -233,6 +254,10 @@
           b.deletePage(); this.updateBar();
           break;
         case 'save': this.save(); break;
+        case 'snap':
+          Tools.set({ snap: !Tools.snap });
+          App.toast(Tools.snap ? 'Snap to grid ON — shapes line up neatly' : 'Snap to grid OFF');
+          break;
         case 'bg': this.showBgMenu(el); break;
         case 'export': this.showExportMenu(el); break;
       }
@@ -259,6 +284,7 @@
       const pop = App.popover(anchor, 'up');
       pop.innerHTML = `<div class="menu">
         <button data-x="png">${icon('image', 18)}Save this page as PNG image</button>
+        <button data-x="view">${icon('fullscreen', 18)}Save what's on screen as PNG</button>
         <button data-x="pdf">${icon('pdf', 18)}Save all pages as PDF</button>
         <button data-x="clip">${icon('copy', 18)}Copy this page (paste in Word / PowerPoint)</button>
         <hr/>
@@ -269,6 +295,7 @@
         if (!x) return;
         App.closePopover();
         if (x.dataset.x === 'png') this.exportPng();
+        if (x.dataset.x === 'view') this.exportPng(true);
         if (x.dataset.x === 'pdf') this.exportPdf();
         if (x.dataset.x === 'clip') this.copyPage();
         if (x.dataset.x === 'saveas') this.save(true);
@@ -277,50 +304,73 @@
 
     async save(saveAs = false) {
       this.board.commitText();
-      const text = JSON.stringify({ app: 'TeachBoard', version: 1, bg: this.board.doc.bg, pages: this.board.doc.pages });
-      const r = await window.api.saveText({ filePath: this.filePath, text, defaultName: this.title + '.tboard', saveAs });
+      const r = await window.api.saveText({ filePath: this.filePath, text: this.serialize(), defaultName: this.title + '.tboard', saveAs });
       if (!r) return false;
       this.filePath = r.path;
       this.setTitle(r.name.replace(/\.tboard$/i, ''));
       this.setDirty(false);
+      this.autosaveNow();
+      App.saveSession();
       App.toast('Saved ' + r.name);
       return true;
     }
 
-    async exportPng() {
-      const c = await this.board.exportPage();
-      if (!c) return App.toast('This page is empty', 'error');
-      const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
-      const p = await window.api.saveBinary({
-        data: new Uint8Array(await blob.arrayBuffer()),
-        defaultName: `${this.title} - page ${this.board.pageIndex + 1}.png`, filterName: 'PNG image', ext: 'png',
-      });
-      if (p) App.toast('Image saved');
-    }
-
-    async copyPage() {
-      const c = await this.board.exportPage();
-      if (!c) return App.toast('This page is empty', 'error');
-      const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
-      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
-      App.toast('Page copied to clipboard');
-    }
-
-    async exportPdf() {
-      const { PDFDocument } = window.PDFLib;
-      const pdf = await PDFDocument.create();
-      let count = 0;
-      for (let i = 0; i < this.board.doc.pages.length; i++) {
-        const c = await this.board.exportPage(i, 2);
-        if (!c) continue;
-        const png = await pdf.embedPng(c.toDataURL('image/png'));
-        const page = pdf.addPage([c.width / 2, c.height / 2]);
-        page.drawImage(png, { x: 0, y: 0, width: c.width / 2, height: c.height / 2 });
-        count++;
+    // Runs an export with a progress toast; any failure is shown instead of silently doing nothing.
+    async runExport(what, fn) {
+      this.board.commitText();
+      const busy = App.toast(`Preparing ${what}…`, 'info', null, 0);
+      try {
+        await fn();
+      } catch (err) {
+        console.error(err);
+        App.toast(`Could not save the ${what}: ${err.message || err}`, 'error');
+      } finally {
+        busy.remove();
       }
-      if (!count) return App.toast('The board is empty', 'error');
-      const p = await window.api.saveBinary({ data: await pdf.save(), defaultName: this.title + '.pdf', filterName: 'PDF document', ext: 'pdf' });
-      if (p) App.toast(`PDF saved (${count} page${count > 1 ? 's' : ''})`);
+    }
+
+    exportPng(viewOnly = false) {
+      return this.runExport('image', async () => {
+        const c = viewOnly ? await this.board.exportView() : await this.board.exportPage();
+        if (!c) { App.toast('This page is empty — draw something first', 'error'); return; }
+        const blob = await TB.canvasToPng(c);
+        const p = await window.api.saveBinary({
+          data: new Uint8Array(await blob.arrayBuffer()),
+          defaultName: `${this.title} - page ${this.board.pageIndex + 1}.png`, filterName: 'PNG image', ext: 'png',
+        });
+        if (p) App.toast('Image saved: ' + p);
+      });
+    }
+
+    copyPage() {
+      return this.runExport('copy', async () => {
+        const c = await this.board.exportPage();
+        if (!c) { App.toast('This page is empty', 'error'); return; }
+        const blob = await TB.canvasToPng(c);
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+        App.toast('Page copied — paste it with Ctrl+V');
+      });
+    }
+
+    exportPdf() {
+      return this.runExport('PDF', async () => {
+        const { PDFDocument } = window.PDFLib;
+        const pdf = await PDFDocument.create();
+        let count = 0;
+        for (let i = 0; i < this.board.doc.pages.length; i++) {
+          const c = await this.board.exportPage(i, 2);
+          if (!c) continue;
+          const png = await pdf.embedPng(new Uint8Array(await (await TB.canvasToPng(c)).arrayBuffer()));
+          // Every page is A4-landscape wide; height follows the drawing.
+          const w = 842, ph = Math.min(14400, (c.height * w) / c.width);
+          const page = pdf.addPage([w, ph]);
+          page.drawImage(png, { x: 0, y: 0, width: w, height: ph });
+          count++;
+        }
+        if (!count) { App.toast('The board is empty — draw something first', 'error'); return; }
+        const p = await window.api.saveBinary({ data: await pdf.save(), defaultName: this.title + '.pdf', filterName: 'PDF document', ext: 'pdf' });
+        if (p) App.toast(`PDF saved (${count} page${count > 1 ? 's' : ''}): ${p}`);
+      });
     }
 
     setupDrop(wrap) {
@@ -364,19 +414,31 @@
       if (!this.dirty || !hasContent) return true;
       return confirm(`"${this.title}" has unsaved changes.\n\nClose it without saving?`);
     }
-    destroy() { this.board.destroy(); super.destroy(); }
+    destroy() {
+      clearTimeout(this.autosaveTimer);
+      window.api.autosaveDelete(this.autosaveId);
+      this.board.destroy();
+      super.destroy();
+    }
   }
+
+  // At most this many PDF pages keep their rendered images; pages further away are freed
+  // (long tutes used to fill memory until the window went white).
+  const PDF_MAX_RENDERED = 8;
+  const PDF_MAX_PAGE_PIXELS = 6e6;
 
   // ======================================================================
   class PdfTab extends TabBase {
-    constructor(filePath) {
+    constructor(filePath, restore = {}) {
       super('pdf', filePath.split(/[\\/]/).pop());
       this.filePath = filePath;
+      this.restoreState = restore;
       this.zoom = 1;
       this.pages = [];
       this.pageDocs = [];
       this.lastBoard = null;
       this.visible = new Set();
+      this.rendered = new Set();
       this.el.innerHTML = `
         <div class="pdf-bar">
           ${btn('prev', 'chevleft', 'Previous page')}
@@ -388,6 +450,7 @@
           ${btn('zoomin', 'plus', 'Zoom in')}
           ${btn('fitwidth', 'fit', 'Fit width', 'Width')}
           ${btn('fitpage', 'board', 'Fit whole page', 'Page')}
+          ${btn('refresh', 'reload', 'Refresh the pages (if they look blank)', 'Refresh')}
           <div class="spacer"></div>
           ${btn('toboard', 'copy', 'Copy this page (with your writing) to a whiteboard', 'To board')}
           ${btn('clearpage', 'trash', 'Remove all writing on this page')}
@@ -426,20 +489,22 @@
         this.pdf = await pdfjsLib.getDocument({ data: f.data }).promise;
         const saved = await window.api.annotLoad(this.filePath);
         this.pagesEl.innerHTML = '';
-        this.io = new IntersectionObserver((entries) => this.onIntersect(entries), { root: this.scroll, rootMargin: '600px 0px' });
+        this.io = new IntersectionObserver((entries) => this.onIntersect(entries), { root: this.scroll, rootMargin: '50% 0px' });
         for (let i = 0; i < this.pdf.numPages; i++) {
           const page = await this.pdf.getPage(i + 1);
           const vp = page.getViewport({ scale: 1 });
-          const div = h(`<div class="pdf-page" data-i="${i}"><canvas class="pdf-canvas"></canvas><canvas class="ink"></canvas><div class="page-num">${i + 1}</div></div>`);
+          const div = h(`<div class="pdf-page" data-i="${i}"><canvas class="pdf-canvas" width="0" height="0"></canvas><canvas class="ink" width="0" height="0"></canvas><div class="page-num">${i + 1}</div></div>`);
           this.pagesEl.appendChild(div);
           this.pages.push({ i, page, w: vp.width, h: vp.height, div, pdfCanvas: div.children[0], inkCanvas: div.children[1], board: null, renderedZoom: 0 });
           const els = (saved && saved.pages && saved.pages[i]) || [];
           this.pageDocs.push({ bg: 'transparent', pages: [{ elements: els }] });
         }
         this.el.querySelector('.page-count').textContent = this.pdf.numPages;
-        this.fitWidth();
+        const r = this.restoreState;
+        if (r.zoom) { this.zoom = r.zoom; this.layoutPages(); } else this.fitWidth();
+        if (r.page) this.gotoPage(r.page);
         this.pages.forEach((p) => this.io.observe(p.div));
-        if (saved && saved.pages && saved.pages.some((p) => p && p.length)) App.toast('Your earlier writing on this PDF was restored');
+        if (saved && saved.pages && saved.pages.some((p) => p && p.length) && !r.page) App.toast('Your earlier writing on this PDF was restored');
       } catch (err) {
         console.error(err);
         this.pagesEl.innerHTML = `<div class="pdf-loading">Could not open this PDF: ${String(err.message || err).replace(/</g, '&lt;')}</div>`;
@@ -488,6 +553,33 @@
         if (e.isIntersecting) { this.visible.add(i); this.renderPage(i); this.ensureBoard(i); }
         else this.visible.delete(i);
       }
+      this.trimPages();
+    }
+
+    // Frees the pages furthest from the screen once too many are held in memory.
+    trimPages() {
+      if (this.rendered.size <= PDF_MAX_RENDERED) return;
+      const cur = this.current || 0;
+      const far = [...this.rendered].filter((i) => !this.visible.has(i)).sort((a, b) => Math.abs(b - cur) - Math.abs(a - cur));
+      while (this.rendered.size > PDF_MAX_RENDERED && far.length) this.freePage(far.shift());
+    }
+    freePage(i) {
+      const p = this.pages[i];
+      if (p.task) { try { p.task.cancel(); } catch {} p.task = null; }
+      p.pdfCanvas.width = p.pdfCanvas.height = 0;
+      p.renderedZoom = 0;
+      if (p.board) {
+        if (p.board === this.lastBoard) this.lastBoard = null;
+        p.board.release();
+      }
+      try { p.page.cleanup(); } catch {}
+      this.rendered.delete(i);
+    }
+    // Re-draws every page from scratch (for when something looks blank or wrong).
+    refresh() {
+      [...this.rendered].forEach((i) => this.freePage(i));
+      this.visible.forEach((i) => { this.renderPage(i); this.ensureBoard(i); });
+      App.toast('Pages refreshed');
     }
 
     async renderPage(i) {
@@ -496,8 +588,11 @@
       const z = this.zoom;
       if (p.renderedZoom === z) return;
       p.renderedZoom = z;
+      this.rendered.add(i);
       if (p.task) { try { p.task.cancel(); } catch {} }
-      const vp = p.page.getViewport({ scale: z * dpr });
+      // Very high zoom renders at a capped resolution; CSS stretches it to the page size.
+      const scale = Math.min(z * dpr, Math.sqrt(PDF_MAX_PAGE_PIXELS / (p.w * p.h)));
+      const vp = p.page.getViewport({ scale });
       const off = document.createElement('canvas');
       off.width = Math.floor(vp.width);
       off.height = Math.floor(vp.height);
@@ -511,12 +606,15 @@
         p.pdfCanvas.getContext('2d').drawImage(off, 0, 0);
       } catch (err) {
         if (err && err.name !== 'RenderingCancelledException') console.error(err);
+      } finally {
+        off.width = off.height = 0;
+        p.task = null;
       }
     }
 
     ensureBoard(i) {
       const p = this.pages[i];
-      if (p.board) return p.board;
+      if (p.board) { p.board.restore(); return p.board; }
       p.board = new Board(p.inkCanvas, {
         mode: 'fixed',
         doc: this.pageDocs[i],
@@ -566,12 +664,15 @@
         case 'zoomout': this.setZoom(this.zoom / 1.2); break;
         case 'fitwidth': this.fitWidth(); break;
         case 'fitpage': this.fitPage(); break;
+        case 'refresh': this.refresh(); break;
         case 'clearpage': { const b = this.ensureBoard(this.current || 0); b.clearPage(); break; }
         case 'toboard': this.copyPageToBoard(); break;
         case 'export': this.exportPdf(); break;
       }
     }
     clear() { this.act('clearpage'); }
+
+    sessionInfo() { return { type: 'pdf', path: this.filePath, page: this.current || 0, zoom: this.zoom }; }
 
     async renderPageImage(i, scale = 2) {
       const p = this.pages[i];
@@ -601,7 +702,8 @@
           c.width = Math.ceil(p.w * 2);
           c.height = Math.ceil(p.h * 2);
           await TB.renderElementsTo(c, els, 2);
-          const png = await doc.embedPng(c.toDataURL('image/png'));
+          const png = await doc.embedPng(new Uint8Array(await (await TB.canvasToPng(c)).arrayBuffer()));
+          c.width = c.height = 0;
           const box = pages[i].getCropBox();
           pages[i].drawImage(png, { x: box.x, y: box.y, width: box.width, height: box.height });
         }
@@ -654,7 +756,8 @@
       this.addr = this.el.querySelector('.address');
       this.progress = this.el.querySelector('.web-progress');
       this.inkCanvas = this.el.querySelector('.web-ink');
-      this.wv.setAttribute('src', url || GOOGLE);
+      this.url = url || GOOGLE;
+      this.wv.setAttribute('src', this.url);
       this.zoomFactor = 1;
       this.ready = false;
 
@@ -691,6 +794,7 @@
     get iconHtml() { return this.favicon ? `<img src="${this.favicon.replace(/"/g, '')}" onerror="this.replaceWith(document.createTextNode(''))">` : icon('globe', 16); }
     get board() { return this.inkOn ? this.inkBoard : null; }
     get usesTools() { return !!this.inkOn; }
+    sessionInfo() { return { type: 'web', url: this.url, title: this.title }; }
 
     navigate(url) { this.ready ? this.wv.loadURL(url) : this.wv.setAttribute('src', url); }
     updateNav() {
