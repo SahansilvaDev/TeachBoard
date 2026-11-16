@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.1.0
+
+### New: never lose your drawings
+- **Minimap:** a small overview of the whole board in the bottom-right corner. The blue box shows where you are, and every drawing shows as at least a coloured dot. Click or drag in the minimap to jump there, scroll on it to zoom, double-click it to show everything. The **map** button on the bottom bar turns it on or off, and TeachBoard remembers your choice.
+- **"Show all"** button (now labelled) and shortcuts **Shift+1** and **Home**: zooms out to fit everything you drew, keeping clear of the minimap and toolbars.
+- **"Your drawings are off screen"** message with a **Show all** button. It appears whenever you have moved to an empty part of the board.
+
+### Fixed
+- "Show all" couldn't zoom out far enough to fit a very spread-out board. The minimum zoom is now 0.5% (was 10%).
+- Arrows now re-attach to a moved shape straight away, instead of on the next screen redraw.
+
 ## 2.0.0
 
 ### New: tools for software and AI architects

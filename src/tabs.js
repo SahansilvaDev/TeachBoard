@@ -174,7 +174,8 @@
             ${btn('zoomout', 'minus', 'Zoom out (Ctrl -)')}
             <span class="readout zoom" data-act="zoomreset" title="Reset zoom (Ctrl 0)">100%</span>
             ${btn('zoomin', 'plus', 'Zoom in (Ctrl +)')}
-            ${btn('fit', 'fit', 'Fit everything on screen')}
+            ${btn('fit', 'fit', 'Show all your drawings (Shift+1 or Home)', 'Show all')}
+            ${btn('minimap', 'map', 'Show / hide the board overview (minimap)')}
           </div>
           <div class="floating-bar bar-bottom-center">
             ${btn('prev', 'chevleft', 'Previous page (Page Up)')}
@@ -189,21 +190,139 @@
             ${btn('export', 'download', 'Export as image / PDF')}
           </div>
           </div>
+          <div class="minimap" title="Board overview — click or drag to move there, double-click to show all">
+            <canvas></canvas>
+          </div>
+          <div class="offscreen-hint" hidden>
+            ${icon('fit', 16)}<span>Your drawings are off screen</span><button data-act="fit">Show all</button>
+          </div>
         </div>`;
-      const canvas = this.el.querySelector('canvas');
+      const canvas = this.el.querySelector('canvas.board');
       this.board = new Board(canvas, {
         mode: 'infinite',
         doc: doc || { bg: 'white', pages: [{ elements: [] }] },
         onChange: () => { this.setDirty(true); this.updateBar(); this.scheduleAutosave(); },
         onActivate: (b) => App.setActiveBoard(b),
         onView: () => this.updateBar(),
+        onRedraw: () => this.scheduleOverview(),
+        // Keep "Show all" clear of the minimap (bottom-right) and the bottom bars.
+        fitInsets: () => ({ right: Tools.minimap ? 260 : 40, bottom: 80 }),
       });
       this.el.addEventListener('click', (e) => {
         const b = e.target.closest('[data-act]');
         if (b) this.act(b.dataset.act, b);
       });
       this.setupDrop(this.el.querySelector('.canvas-wrap'));
+      this.setupMinimap();
       this.updateBar();
+    }
+
+    // ----- Board overview: minimap + "your drawings are off screen" hint -----
+    setupMinimap() {
+      this.mini = this.el.querySelector('.minimap');
+      this.miniCanvas = this.mini.querySelector('canvas');
+      this.hint = this.el.querySelector('.offscreen-hint');
+      const toWorld = (e) => {
+        const reg = this.miniDrag || this.miniRegion;
+        if (!reg) return null;
+        const r = this.miniCanvas.getBoundingClientRect();
+        return [reg.r.x + (e.clientX - r.left) / reg.scale, reg.r.y + (e.clientY - r.top) / reg.scale];
+      };
+      this.miniCanvas.addEventListener('pointerdown', (e) => {
+        if (!this.miniRegion) return;
+        // Keep the overview still while dragging, otherwise it would shift under the pointer.
+        this.miniDrag = this.miniRegion;
+        this.miniCanvas.setPointerCapture(e.pointerId);
+        const p = toWorld(e);
+        if (p) this.board.centerOn(p[0], p[1]);
+      });
+      this.miniCanvas.addEventListener('pointermove', (e) => {
+        if (!this.miniDrag) return;
+        const p = toWorld(e);
+        if (p) this.board.centerOn(p[0], p[1]);
+      });
+      const end = () => { this.miniDrag = null; this.scheduleOverview(); };
+      this.miniCanvas.addEventListener('pointerup', end);
+      this.miniCanvas.addEventListener('pointercancel', end);
+      this.miniCanvas.addEventListener('dblclick', () => this.board.fitContent());
+      this.miniCanvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        this.board.zoomBy(e.deltaY < 0 ? 1.2 : 1 / 1.2);
+      }, { passive: false });
+    }
+
+    scheduleOverview() {
+      if (this.overviewRaf) return;
+      this.overviewRaf = requestAnimationFrame(() => { this.overviewRaf = 0; this.updateOverview(); });
+    }
+
+    updateOverview() {
+      const b = this.board;
+      if (!b.cssW) return;
+      const els = b.els;
+      const vis = b.visibleRect();
+      const content = TB.unionBox(els);
+
+      // Off-screen hint: there is something on this page, but none of it is visible.
+      const lost = !!content && !els.some((e) => TB.boxesOverlap(TB.bbox(e), vis));
+      this.hint.hidden = !lost;
+
+      this.mini.hidden = !Tools.minimap;
+      if (!Tools.minimap) return;
+      const W = 220, H = 140, dpr = window.devicePixelRatio || 1;
+      const c = this.miniCanvas;
+      if (c.width !== W * dpr) { c.width = W * dpr; c.height = H * dpr; c.style.width = W + 'px'; c.style.height = H + 'px'; }
+      const ctx = c.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, W, H);
+
+      let reg = this.miniDrag;
+      if (!reg) {
+        // Show everything drawn plus where you are now, with a little margin, in the minimap's shape.
+        let r = vis;
+        if (content) {
+          const x0 = Math.min(content.x, vis.x), y0 = Math.min(content.y, vis.y);
+          const x1 = Math.max(content.x + content.w, vis.x + vis.w), y1 = Math.max(content.y + content.h, vis.y + vis.h);
+          r = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+        }
+        const m = Math.max(r.w, r.h) * 0.06;
+        r = { x: r.x - m, y: r.y - m, w: r.w + 2 * m, h: r.h + 2 * m };
+        if (r.w / r.h > W / H) { const nh = (r.w * H) / W; r.y -= (nh - r.h) / 2; r.h = nh; }
+        else { const nw = (r.h * W) / H; r.x -= (nw - r.w) / 2; r.w = nw; }
+        reg = { r, scale: W / r.w };
+        this.miniRegion = reg;
+      }
+      const bg = TB.bgById(b.doc.bg).color ? b.doc.bg : 'white';
+      TB.drawThumb(ctx, els, bg, reg.r, reg.scale, () => this.scheduleOverview());
+      // Drawings far apart become smaller than a pixel: mark each one so it can always be found.
+      for (const el of els.length > 3000 ? els.slice(-3000) : els) {
+        const bb = TB.bbox(el);
+        const w = bb.w * reg.scale, h = bb.h * reg.scale;
+        if (w >= 4 && h >= 4) continue;
+        const cx = (bb.x - reg.r.x) * reg.scale + w / 2, cy = (bb.y - reg.r.y) * reg.scale + h / 2;
+        ctx.fillStyle = el.type === 'image' ? '#64748b' : el.color || '#64748b';
+        ctx.beginPath();
+        ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Dim everything outside the visible area and outline where you are.
+      const vx = (vis.x - reg.r.x) * reg.scale, vy = (vis.y - reg.r.y) * reg.scale;
+      const vw = vis.w * reg.scale, vh = vis.h * reg.scale;
+      ctx.fillStyle = 'rgba(15,23,42,0.12)';
+      ctx.beginPath();
+      ctx.rect(0, 0, W, H);
+      ctx.rect(vx, vy, vw, vh);
+      ctx.fill('evenodd');
+      ctx.strokeStyle = '#3b82f6';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(vx, vy, Math.max(4, vw), Math.max(4, vh));
+      if (!content) {
+        ctx.fillStyle = TB.bgById(bg).dark ? '#cbd5e1' : '#64748b';
+        ctx.font = '12px "Segoe UI", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Empty board', W / 2, H / 2 + 4);
+      }
     }
     get board() { return this._board; }
     set board(b) { this._board = b; }
@@ -237,6 +356,7 @@
       this.el.querySelector('.pages').textContent = `${b.pageIndex + 1} / ${b.doc.pages.length}`;
       this.el.querySelector('.zoom').textContent = Math.round(b.view.zoom * 100) + '%';
       this.el.querySelector('[data-act=snap]').classList.toggle('on', !!Tools.snap);
+      this.el.querySelector('[data-act=minimap]').classList.toggle('on', !!Tools.minimap);
     }
 
     async act(act, el) {
@@ -246,6 +366,7 @@
         case 'zoomout': b.zoomBy(0.8); break;
         case 'zoomreset': b.resetView(); break;
         case 'fit': b.fitContent(); break;
+        case 'minimap': Tools.set({ minimap: !Tools.minimap }); break;
         case 'prev': this.gotoPage(b.pageIndex - 1); break;
         case 'next': this.gotoPage(b.pageIndex + 1); break;
         case 'addpage': b.addPage(); this.updateBar(); break;

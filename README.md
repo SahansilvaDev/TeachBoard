@@ -11,7 +11,7 @@ A free Windows desktop alternative to Microsoft Whiteboard.
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
 ![Electron](https://img.shields.io/badge/Electron-33-47848F?logo=electron&logoColor=white)
 ![JavaScript](https://img.shields.io/badge/JavaScript-ES2022-F7DF1E?logo=javascript&logoColor=black)
-![Version](https://img.shields.io/badge/version-2.0.0-3b82f6)
+![Version](https://img.shields.io/badge/version-2.1.0-3b82f6)
 
 **[⬇ Download the latest version](https://github.com/SahansilvaDev/TeachBoard/releases/latest)**
 
@@ -20,6 +20,13 @@ A free Windows desktop alternative to Microsoft Whiteboard.
 ---
 
 ![TeachBoard whiteboard with a network diagram, a flowchart and a code block](docs/screenshots/whiteboard.png)
+
+## What's new in version 2.1
+
+- **Never lose your drawings:**
+  - a **minimap** (board overview) in the corner shows everything you drew and where you are; click it to jump there
+  - **Show all** (or `Shift+1` / `Home`) brings every drawing back on screen
+  - when you've moved to an empty area, a message offers to take you back
 
 ## What's new in version 2
 
@@ -59,6 +66,7 @@ Microsoft Whiteboard is being retired, and most whiteboard apps are made for bus
   - Tables (for example, truth tables)
 - Double-click any shape to **type inside it**.
 - **Infinite canvas:** two-finger scroll to move, pinch or Ctrl + wheel to zoom.
+- **Board overview (minimap):** see the whole board in the corner, with your drawings and where you are. Click or drag in it to move there. **Show all** (`Shift+1` / `Home`) fits every drawing on screen, and a message appears if you've moved away from everything you drew.
 - **Multiple pages** and backgrounds (white, grid, dots, ruled, dark, chalkboard, blueprint).
 - Select, move, resize, recolour, duplicate and delete; full **undo / redo**.
 - **Images:** paste a screenshot, drag and drop, or insert from a file.
@@ -180,6 +188,7 @@ Installed copies check GitHub Releases on start-up and update themselves. **The 
 | `1` … `0` | Pick a colour |
 | `[` / `]` | Thinner / thicker |
 | `Space` + drag | Pan the board |
+| `Shift 1` / `Home` | Show all your drawings |
 | `Ctrl` + wheel / pinch | Zoom |
 | `Ctrl Z` / `Ctrl Y` | Undo / Redo |
 | `Ctrl C` / `Ctrl V` / `Ctrl D` | Copy / Paste / Duplicate |

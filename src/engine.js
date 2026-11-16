@@ -43,6 +43,7 @@
     tableCols: 3,
     smoothing: 50, // 0 = raw input, 100 = very steady ink
     snap: false, // snap shapes to a 20-unit grid
+    minimap: true, // show the board overview in the corner
     route: 'elbow', // connector style: straight | elbow | curve
     startArrow: false,
     endArrow: true,
@@ -64,6 +65,8 @@
   }
   const LINE_KINDS = new Set(['line', 'arrow', 'dblarrow']);
   const GRID = 20;
+  const MIN_ZOOM = 0.005; // far enough out that "Show all" fits even a very spread-out board
+  const MAX_ZOOM = 8;
   const snapV = (v) => Math.round(v / GRID) * GRID;
 
   let idSeq = 0;
@@ -1025,14 +1028,14 @@
       // Never accept a zero / negative / NaN zoom: the background grid loop would never end.
       if ('zoom' in v && !(v.zoom > 0 && Number.isFinite(v.zoom))) return;
       if (('x' in v && !Number.isFinite(v.x)) || ('y' in v && !Number.isFinite(v.y))) return;
-      if ('zoom' in v) v = { ...v, zoom: Math.min(8, Math.max(0.05, v.zoom)) };
+      if ('zoom' in v) v = { ...v, zoom: Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, v.zoom)) };
       Object.assign(this.view, v);
       this.dirty = true;
       this.requestDraw();
       if (this.opts.onView) this.opts.onView(this.view);
     }
     zoomAt(sx, sy, factor) {
-      const z = Math.min(8, Math.max(0.1, this.view.zoom * factor));
+      const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, this.view.zoom * factor));
       const [wx, wy] = this.toWorld(sx, sy);
       this.setView({ zoom: z, x: wx - sx / z, y: wy - sy / z });
     }
@@ -1041,8 +1044,21 @@
     fitContent() {
       const b = unionBox(this.els);
       if (!b) return this.resetView();
-      const z = Math.min(4, Math.max(0.1, Math.min((this.cssW - 80) / b.w, (this.cssH - 80) / b.h)));
-      this.setView({ zoom: z, x: b.x + b.w / 2 - this.cssW / 2 / z, y: b.y + b.h / 2 - this.cssH / 2 / z });
+      if (!this.cssW || !this.cssH) return;
+      // Screen space covered by toolbars / minimap, so nothing ends up hidden behind them.
+      const ins = { left: 40, top: 40, right: 40, bottom: 80, ...(this.opts.fitInsets ? this.opts.fitInsets() : {}) };
+      const aw = Math.max(100, this.cssW - ins.left - ins.right), ah = Math.max(100, this.cssH - ins.top - ins.bottom);
+      const z = Math.min(4, Math.max(MIN_ZOOM, Math.min(aw / b.w, ah / b.h)));
+      const sx = ins.left + aw / 2, sy = ins.top + ah / 2; // screen point the content is centred on
+      this.setView({ zoom: z, x: b.x + b.w / 2 - sx / z, y: b.y + b.h / 2 - sy / z });
+    }
+    // Moves the view so a world point sits in the middle of the screen (minimap navigation).
+    centerOn(wx, wy) {
+      this.setView({ x: wx - this.cssW / 2 / this.view.zoom, y: wy - this.cssH / 2 / this.view.zoom });
+    }
+    // The part of the board currently on screen, in world units.
+    visibleRect() {
+      return { x: this.view.x, y: this.view.y, w: this.cssW / this.view.zoom, h: this.cssH / this.view.zoom };
     }
 
     resize() {
@@ -1448,7 +1464,7 @@
         const [p, q] = [...this.pointers.values()];
         if (!q) return;
         const d = Math.hypot(p.x - q.x, p.y - q.y);
-        const z = Math.min(8, Math.max(0.1, (a.z0 * d) / a.d0));
+        const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, (a.z0 * d) / a.d0));
         const mx = (p.x + q.x) / 2, my = (p.y + q.y) / 2;
         this.setView({ zoom: z, x: a.c0[0] - mx / z, y: a.c0[1] - my / z });
         return;
@@ -1632,7 +1648,7 @@
             const picked = this.els.filter((el) => boxesOverlap(bbox(el), a.rect));
             this.sel = e.shiftKey ? [...new Set([...this.sel, ...picked])] : picked;
           }
-          if (a.originals) this.changed();
+          if (a.originals) { this.syncConnectors(); this.changed(); } // re-attach arrows right away, not on the next frame
           this.invalidate();
           break;
         default:
@@ -1906,6 +1922,8 @@
         if (!boxesOverlap(bbox(el), vis)) continue;
         drawElement(b, el, onImg);
       }
+      // Content or view changed: let the tab update its overview (minimap, off-screen hint).
+      if (this.opts.onRedraw) this.opts.onRedraw(this);
     }
 
     renderNow() {
@@ -2065,6 +2083,15 @@
     }
   }
 
+  // Draws a region of the board into ctx at the given scale (minimap thumbnails).
+  function drawThumb(ctx, els, bg, region, scale, onImageLoad) {
+    ctx.save();
+    drawBackground(ctx, bg, { x: region.x, y: region.y, zoom: scale }, region.w * scale, region.h * scale);
+    ctx.transform(scale, 0, 0, scale, -region.x * scale, -region.y * scale);
+    for (const el of els) drawElement(ctx, el, onImageLoad);
+    ctx.restore();
+  }
+
   const EXPORT_MAX_SIDE = 8192;
   const EXPORT_MAX_PIXELS = 40e6;
   function renderRegion(r, els, bg, scale, withBg) {
@@ -2116,7 +2143,7 @@
   }
 
   window.TB = {
-    Board, Tools, BACKGROUNDS, bgById, SHAPES, SHAPE_GROUPS, DEFAULT_SIZE, FONTS,
+    Board, Tools, BACKGROUNDS, bgById, SHAPES, SHAPE_GROUPS, DEFAULT_SIZE, FONTS, drawThumb, unionBox, bbox, boxesOverlap,
     drawShapeIcon, renderElementsTo, loadImage, isDarkColor, registerShapes, canvasToPng, uid, hexA,
   };
 })();

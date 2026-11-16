@@ -18,7 +18,7 @@
     { id: 'connector', icon: 'connector', title: 'Connector (C) — drag from one shape to another; the arrow follows when you move them' },
   ];
   // Tool settings remembered between sessions.
-  const SAVED_TOOLS = ['tool', 'color', 'size', 'shape', 'fill', 'dash', 'font', 'textStyle', 'fontSize', 'eraserMode', 'smoothing', 'snap', 'route', 'startArrow', 'endArrow'];
+  const SAVED_TOOLS = ['tool', 'color', 'size', 'shape', 'fill', 'dash', 'font', 'textStyle', 'fontSize', 'eraserMode', 'smoothing', 'snap', 'route', 'startArrow', 'endArrow', 'minimap'];
 
   const App = (window.App = {
     tabs: [],
@@ -496,7 +496,7 @@
 
     onToolsChanged(patch) {
       if ('tool' in patch) Board.all.forEach((b) => b.updateCursor());
-      if ('snap' in patch) this.tabs.forEach((t) => t instanceof BoardTab && t.updateBar());
+      if ('snap' in patch || 'minimap' in patch) this.tabs.forEach((t) => { if (t instanceof BoardTab) { t.updateBar(); t.updateOverview(); } });
       this.refreshRail();
     },
 
@@ -670,6 +670,7 @@
         ['S / R / O / A', 'Shapes / Rectangle / Ellipse / Arrow'],
         ['1 … 0', 'Pick colour'], ['[  ]', 'Thinner / thicker'],
         ['Space + drag', 'Pan the board'], ['Ctrl + wheel / pinch', 'Zoom'], ['Two-finger scroll', 'Move around the board'],
+        ['Shift 1  or  Home', 'Show all your drawings (lost them? press this)'],
         ['Ctrl Z / Ctrl Y', 'Undo / Redo'], ['Delete', 'Delete selected'], ['Ctrl C / Ctrl V / Ctrl D', 'Copy / Paste / Duplicate'],
         ['Ctrl V (image)', 'Paste a screenshot or copied image'], ['Shift + drag', 'Straight line / perfect square'],
         ['Page Up / Down', 'Previous / next board page'],
@@ -852,6 +853,8 @@
         return;
       }
       if ((k === 'PageDown' || k === 'PageUp') && tab instanceof BoardTab) { prevent(); tab.act(k === 'PageDown' ? 'next' : 'prev'); return; }
+      // Shift+1 / Home: show all drawings (the key is "!" with Shift on most layouts, so check the code too).
+      if (tab instanceof BoardTab && (k === 'Home' || (e.shiftKey && (e.code === 'Digit1' || k === '!')))) { prevent(); tab.board.fitContent(); return; }
       if (ctrl || e.altKey) return;
 
       const toolKeys = { v: 'select', h: 'hand', p: 'pen', m: 'highlighter', e: 'eraser', l: 'laser', t: 'text', s: 'shape', c: 'connector' };
